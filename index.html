@@ -2660,10 +2660,10 @@ function ExerciseRow({
 
   const setPhotoUrl = () => {
     const url = prompt(
-      "Вставь прямую ссылку на короткий GIF (лучше .gif) или видео (.mp4/.webm).
+      `Вставь прямую ссылку на короткий GIF (лучше .gif) или видео (.mp4/.webm).
 Подойдут: https://...  или data:image/... / data:video/...
 
-Оставь пустым и нажми OK — чтобы отменить.",
+Оставь пустым и нажми OK — чтобы отменить.`,
       data?.library?.exerciseMedia?.[ex.id] || ""
     );
     if (url === null) return; // cancel
