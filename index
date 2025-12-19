@@ -1,0 +1,2816 @@
+import React, { useEffect, useMemo, useState } from "react";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
+import { Badge } from "@/components/ui/badge";
+import { Separator } from "@/components/ui/separator";
+import { Textarea } from "@/components/ui/textarea";
+import { Checkbox } from "@/components/ui/checkbox";
+import {
+  LineChart,
+  Line,
+  CartesianGrid,
+  XAxis,
+  YAxis,
+  Tooltip,
+  ResponsiveContainer,
+  BarChart,
+  Bar,
+  Legend,
+} from "recharts";
+
+// -----------------------------
+// Small, practical, "good-enough" logic (not medical advice)
+// -----------------------------
+
+const STORAGE_KEY = "vibe_sport_coach_v5";
+const NL = String.fromCharCode(10);
+const NL2 = NL + NL;
+
+const clamp = (n: number, a: number, b: number) => Math.max(a, Math.min(b, n));
+const round = (n: number, d = 0) => {
+  const p = 10 ** d;
+  return Math.round((Number(n) + Number.EPSILON) * p) / p;
+};
+
+function toISODateLocal(d: Date) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const da = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${da}`;
+}
+
+function parseISODateLocal(iso: string) {
+  const [y, m, d] = String(iso).split("-").map((x) => Number(x));
+  return new Date(y || 1970, (m || 1) - 1, d || 1);
+}
+
+function addDaysISO(iso: string, days: number) {
+  const d = parseISODateLocal(iso);
+  d.setDate(d.getDate() + days);
+  return toISODateLocal(d);
+}
+
+function weekStartMondayISO(now = new Date()) {
+  const d = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const weekdayMon0 = (d.getDay() + 6) % 7; // Mon=0 ... Sun=6
+  d.setDate(d.getDate() - weekdayMon0);
+  return toISODateLocal(d);
+}
+
+function calcBMR({ sex, weightKg, heightCm, age }: { sex: string; weightKg: number; heightCm: number; age: number }) {
+  // Mifflin-St Jeor
+  const w = Number(weightKg) || 0;
+  const h = Number(heightCm) || 0;
+  const a = Number(age) || 0;
+  if (!w || !h || !a) return 0;
+  if (sex === "female") return 10 * w + 6.25 * h - 5 * a - 161;
+  return 10 * w + 6.25 * h - 5 * a + 5;
+}
+
+function activityFactor(level: string) {
+  switch (level) {
+    case "sedentary":
+      return 1.2;
+    case "light":
+      return 1.375;
+    case "moderate":
+      return 1.55;
+    case "high":
+      return 1.725;
+    case "athlete":
+      return 1.9;
+    default:
+      return 1.55;
+  }
+}
+
+function paceToKgPerWeek(pace: string) {
+  if (pace === "conservative") return 0.35;
+  if (pace === "aggressive") return 0.9;
+  return 0.6;
+}
+
+function estimateWeeklyForecast({ currentWeightKg, loseKg, pace }: { currentWeightKg: number; loseKg: number; pace: string }) {
+  const start = Number(currentWeightKg) || 0;
+  const targetLoss = clamp(Number(loseKg) || 0, 0, 80);
+  const rate = paceToKgPerWeek(pace);
+  if (!start || !targetLoss) return [] as Array<{ week: string; weight: number }>;
+
+  const weeks = clamp(Math.ceil(targetLoss / rate), 1, 52);
+  const data: Array<{ week: string; weight: number }> = [];
+  for (let i = 0; i <= weeks; i++) {
+    const progressLoss = clamp(i * rate, 0, targetLoss);
+    const projected = round(start - progressLoss, 1);
+    data.push({ week: `Нед ${i}`, weight: projected });
+  }
+  return data;
+}
+
+// -----------------------------
+// Macro targets (auto)
+// -----------------------------
+
+function macroTargets({ weightKg, caloriesTarget, focus }: { weightKg: number; caloriesTarget: number; focus: string }) {
+  const w = Number(weightKg) || 0;
+  const cal = Number(caloriesTarget) || 0;
+  if (!w || !cal) return { p: 0, f: 0, c: 0 };
+
+  const p = clamp(Math.round(w * (focus === "fat_loss" ? 1.9 : 1.7)), 80, 240);
+  const f = clamp(Math.round(w * 0.8), 40, 120);
+  const kcalPF = p * 4 + f * 9;
+  const c = Math.max(0, Math.round((cal - kcalPF) / 4));
+  return { p, f, c };
+}
+
+// -----------------------------
+// Food templates (per 1 serving) + FOOD DB (per 100g)
+// -----------------------------
+
+const UNIT_KIND: Record<string, "piece" | "liquid" | "mass"> = {
+  "шт": "piece",
+  "бан": "piece",
+  "батон": "piece",
+  "пач": "piece",
+  "гол": "piece",
+  "л": "liquid",
+  "мл": "liquid",
+  "г": "mass",
+};
+
+function formatShoppingQty(qty: number, unit: string) {
+  const kind = UNIT_KIND[unit] || "mass";
+  if (kind === "piece") return `${Math.ceil(qty)} ${unit}`;
+  if (unit === "мл") return `${Math.round(qty / 10) * 10} мл`;
+  if (unit === "л") return `${round(qty, 1)} л`;
+  return `${Math.round(qty)} ${unit}`;
+}
+
+type Ingredient = { name: string; qty: number; unit: string };
+
+type Meal = {
+  name: string;
+  kcal: number;
+  p: number;
+  f: number;
+  c: number;
+  ingredients: Ingredient[];
+};
+
+type FoodItem = {
+  id: string;
+  name: string;
+  kcal100: number;
+  p100: number;
+  f100: number;
+  c100: number;
+  tags?: string[];
+};
+
+// Очень грубые усреднения (подойдут для прототипа)
+const FOOD_DB: FoodItem[] = [
+  { id: "chicken_breast", name: "Куриная грудка (готовая)", kcal100: 165, p100: 31, f100: 3.6, c100: 0, tags: ["protein"] },
+  { id: "turkey", name: "Индейка (готовая)", kcal100: 150, p100: 29, f100: 2.5, c100: 0, tags: ["protein"] },
+  { id: "tuna", name: "Тунец (консерва, в собственном)", kcal100: 120, p100: 26, f100: 1, c100: 0, tags: ["protein"] },
+  { id: "salmon", name: "Лосось (готовый)", kcal100: 210, p100: 22, f100: 13, c100: 0, tags: ["protein", "fat"] },
+  { id: "eggs", name: "Яйца (цельные)", kcal100: 143, p100: 13, f100: 10, c100: 1, tags: ["protein", "fat"] },
+  { id: "cottage", name: "Творог 5%", kcal100: 121, p100: 17, f100: 5, c100: 3, tags: ["protein"] },
+  { id: "yogurt", name: "Йогурт натуральный", kcal100: 60, p100: 4, f100: 3, c100: 5, tags: ["protein"] },
+  { id: "kefir", name: "Кефир 1%", kcal100: 40, p100: 3, f100: 1, c100: 4, tags: ["protein"] },
+
+  { id: "oats", name: "Овсяные хлопья", kcal100: 370, p100: 13, f100: 7, c100: 62, tags: ["carb"] },
+  { id: "rice", name: "Рис (сырой)", kcal100: 360, p100: 7, f100: 1, c100: 79, tags: ["carb"] },
+  { id: "buckwheat", name: "Гречка (сырая)", kcal100: 343, p100: 13, f100: 3, c100: 71, tags: ["carb"] },
+  { id: "pasta", name: "Паста (сырая)", kcal100: 350, p100: 12, f100: 2, c100: 72, tags: ["carb"] },
+  { id: "potato", name: "Картофель", kcal100: 77, p100: 2, f100: 0.1, c100: 17, tags: ["carb"] },
+  { id: "bread", name: "Хлеб цельнозерновой", kcal100: 250, p100: 9, f100: 4, c100: 43, tags: ["carb"] },
+
+  { id: "olive_oil", name: "Оливковое масло", kcal100: 884, p100: 0, f100: 100, c100: 0, tags: ["fat"] },
+  { id: "nuts", name: "Орехи (микс)", kcal100: 600, p100: 15, f100: 55, c100: 10, tags: ["fat"] },
+
+  { id: "banana", name: "Банан", kcal100: 89, p100: 1.1, f100: 0.3, c100: 23, tags: ["carb", "fruit"] },
+  { id: "apple", name: "Яблоко", kcal100: 52, p100: 0.3, f100: 0.2, c100: 14, tags: ["carb", "fruit"] },
+  { id: "berries", name: "Ягоды (замор.)", kcal100: 50, p100: 1, f100: 0.5, c100: 10, tags: ["carb", "fruit"] },
+
+  { id: "veg_mix", name: "Овощи (замор. смесь)", kcal100: 50, p100: 2, f100: 0.5, c100: 9, tags: ["veg"] },
+  { id: "tomato", name: "Помидоры", kcal100: 18, p100: 0.9, f100: 0.2, c100: 3.9, tags: ["veg"] },
+  { id: "cucumber", name: "Огурцы", kcal100: 15, p100: 0.7, f100: 0.1, c100: 3.6, tags: ["veg"] },
+  { id: "broccoli", name: "Брокколи", kcal100: 34, p100: 2.8, f100: 0.4, c100: 7, tags: ["veg"] },
+];
+
+type MealFoodEntry = { foodId: string; grams: number };
+
+function foodById(id: string) {
+  return FOOD_DB.find((f) => f.id === id) || null;
+}
+
+function macrosFromFood(food: FoodItem, grams: number) {
+  const g = Number(grams) || 0;
+  const k = g / 100;
+  return {
+    kcal: round(food.kcal100 * k, 0),
+    p: round(food.p100 * k, 1),
+    f: round(food.f100 * k, 1),
+    c: round(food.c100 * k, 1),
+  };
+}
+
+function computeMealFromFoods(entries: MealFoodEntry[]) {
+  const sum = { kcal: 0, p: 0, f: 0, c: 0 };
+  const parts: string[] = [];
+  for (const e of entries || []) {
+    const food = foodById(e.foodId);
+    const grams = Number(e.grams) || 0;
+    if (!food || grams <= 0) continue;
+    const m = macrosFromFood(food, grams);
+    sum.kcal += Number(m.kcal) || 0;
+    sum.p += Number(m.p) || 0;
+    sum.f += Number(m.f) || 0;
+    sum.c += Number(m.c) || 0;
+    parts.push(`${food.name} ${Math.round(grams)}г`);
+  }
+  return {
+    name: parts.length ? parts.join(", ") : "",
+    kcal: Math.round(sum.kcal),
+    p: round(sum.p, 1),
+    f: round(sum.f, 1),
+    c: round(sum.c, 1),
+  };
+}
+
+const FOOD_LIBRARY: Record<string, Meal[]> = {
+  breakfast: [
+    {
+      name: "Овсянка + ягоды + йогурт",
+      kcal: 430,
+      p: 24,
+      f: 10,
+      c: 60,
+      ingredients: [
+        { name: "овсяные хлопья", qty: 60, unit: "г" },
+        { name: "йогурт натуральный", qty: 200, unit: "г" },
+        { name: "ягоды (замор.)", qty: 120, unit: "г" },
+        { name: "мёд", qty: 10, unit: "г" },
+      ],
+    },
+    {
+      name: "Яйца + тост + овощи",
+      kcal: 460,
+      p: 26,
+      f: 18,
+      c: 45,
+      ingredients: [
+        { name: "яйца", qty: 2, unit: "шт" },
+        { name: "хлеб цельнозерновой", qty: 2, unit: "шт" },
+        { name: "помидоры", qty: 150, unit: "г" },
+        { name: "огурцы", qty: 150, unit: "г" },
+        { name: "оливковое масло", qty: 5, unit: "мл" },
+      ],
+    },
+  ],
+  lunch: [
+    {
+      name: "Курица + рис + салат",
+      kcal: 650,
+      p: 45,
+      f: 14,
+      c: 82,
+      ingredients: [
+        { name: "куриная грудка", qty: 170, unit: "г" },
+        { name: "рис", qty: 80, unit: "г" },
+        { name: "салатные листья", qty: 60, unit: "г" },
+        { name: "помидоры", qty: 150, unit: "г" },
+        { name: "огурцы", qty: 150, unit: "г" },
+      ],
+    },
+    {
+      name: "Тунец + картофель + овощи",
+      kcal: 640,
+      p: 42,
+      f: 12,
+      c: 88,
+      ingredients: [
+        { name: "тунец консервированный", qty: 1, unit: "бан" },
+        { name: "картофель", qty: 350, unit: "г" },
+        { name: "замороженные овощи", qty: 250, unit: "г" },
+        { name: "лимон", qty: 0.25, unit: "шт" },
+      ],
+    },
+  ],
+  dinner: [
+    {
+      name: "Рыба + гречка + овощи",
+      kcal: 590,
+      p: 40,
+      f: 18,
+      c: 62,
+      ingredients: [
+        { name: "рыба (лосось/хек)", qty: 170, unit: "г" },
+        { name: "гречка", qty: 70, unit: "г" },
+        { name: "брокколи (замор.)", qty: 250, unit: "г" },
+        { name: "лимон", qty: 0.25, unit: "шт" },
+      ],
+    },
+    {
+      name: "Индейка + паста + соус томатный",
+      kcal: 620,
+      p: 42,
+      f: 16,
+      c: 78,
+      ingredients: [
+        { name: "фарш индейки", qty: 170, unit: "г" },
+        { name: "паста из твёрд. сортов", qty: 80, unit: "г" },
+        { name: "томатный соус", qty: 120, unit: "г" },
+        { name: "лук", qty: 60, unit: "г" },
+        { name: "чеснок", qty: 0.2, unit: "гол" },
+      ],
+    },
+  ],
+  snack: [
+    {
+      name: "Творог + фрукты",
+      kcal: 300,
+      p: 28,
+      f: 6,
+      c: 32,
+      ingredients: [
+        { name: "творог 2–5%", qty: 200, unit: "г" },
+        { name: "бананы", qty: 0.5, unit: "шт" },
+        { name: "яблоки", qty: 1, unit: "шт" },
+      ],
+    },
+    {
+      name: "Орехи + кефир",
+      kcal: 320,
+      p: 14,
+      f: 18,
+      c: 22,
+      ingredients: [
+        { name: "орехи ассорти", qty: 25, unit: "г" },
+        { name: "кефир", qty: 300, unit: "мл" },
+      ],
+    },
+  ],
+};
+
+function pickMeal(libraryArray: Meal[], seed: number) {
+  if (!libraryArray?.length) return null;
+  const idx = Math.abs(seed) % libraryArray.length;
+  return libraryArray[idx];
+}
+
+function scaleMeal(meal: Meal | null, factor: number) {
+  if (!meal) return null;
+  const f = clamp(Number(factor) || 1, 0.6, 1.6);
+  return {
+    ...meal,
+    scale: f,
+    kcal: Math.round(meal.kcal * f),
+    p: Math.round(meal.p * f),
+    f: Math.round(meal.f * f),
+    c: Math.round(meal.c * f),
+    ingredients: (meal.ingredients || []).map((ing) => ({
+      ...ing,
+      qty: (Number(ing.qty) || 0) * f,
+    })),
+  };
+}
+
+type PlannedMeal = ReturnType<typeof scaleMeal> & { slot: string };
+
+type PlannedDay = {
+  day: string;
+  dateISO: string;
+  meals: PlannedMeal[];
+  totals: { kcal: number; p: number; f: number; c: number };
+  scale: number;
+};
+
+function generateWeeklyMenu({ caloriesTarget, seed = 1, weekStartISO }: { caloriesTarget: number; seed?: number; weekStartISO: string }) {
+  const kcalTarget = Number(caloriesTarget) || 2000;
+  const days: PlannedDay[] = [];
+  const labels = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"];
+
+  for (let i = 0; i < 7; i++) {
+    const b0 = pickMeal(FOOD_LIBRARY.breakfast, seed + i);
+    const l0 = pickMeal(FOOD_LIBRARY.lunch, seed + i + 10);
+    const d0 = pickMeal(FOOD_LIBRARY.dinner, seed + i + 20);
+    const s0 = pickMeal(FOOD_LIBRARY.snack, seed + i + 30);
+
+    const baseTotal = (b0?.kcal || 0) + (l0?.kcal || 0) + (d0?.kcal || 0) + (s0?.kcal || 0);
+    const factor = baseTotal ? clamp(kcalTarget / baseTotal, 0.8, 1.25) : 1;
+
+    const b = scaleMeal(b0, factor);
+    const l = scaleMeal(l0, factor);
+    const d = scaleMeal(d0, factor);
+    const s = scaleMeal(s0, factor);
+
+    const total = (b?.kcal || 0) + (l?.kcal || 0) + (d?.kcal || 0) + (s?.kcal || 0);
+    const p = (b?.p || 0) + (l?.p || 0) + (d?.p || 0) + (s?.p || 0);
+    const f = (b?.f || 0) + (l?.f || 0) + (d?.f || 0) + (s?.f || 0);
+    const c = (b?.c || 0) + (l?.c || 0) + (d?.c || 0) + (s?.c || 0);
+
+    const dateISO = addDaysISO(weekStartISO, i);
+
+    days.push({
+      day: labels[i],
+      dateISO,
+      meals: [
+        b ? ({ slot: "Завтрак", ...b } as PlannedMeal) : null,
+        l ? ({ slot: "Обед", ...l } as PlannedMeal) : null,
+        d ? ({ slot: "Ужин", ...d } as PlannedMeal) : null,
+        s ? ({ slot: "Перекус", ...s } as PlannedMeal) : null,
+      ].filter(Boolean) as PlannedMeal[],
+      totals: { kcal: total, p, f, c },
+      scale: factor,
+    });
+  }
+  return days;
+}
+
+function mergeShoppingItems(items: Ingredient[]) {
+  const map = new Map<string, Ingredient>();
+  for (const it of items) {
+    const key = `${it.name}__${it.unit}`;
+    const prev = map.get(key);
+    map.set(key, { ...it, qty: (prev?.qty || 0) + (Number(it.qty) || 0) });
+  }
+  return Array.from(map.values()).sort((a, b) => a.name.localeCompare(b.name, "ru"));
+}
+
+function buildShoppingList(menu: PlannedDay[]) {
+  const all: Ingredient[] = [];
+  for (const day of menu || []) {
+    for (const meal of day.meals || []) {
+      for (const it of meal.ingredients || []) all.push(it);
+    }
+  }
+  return mergeShoppingItems(all);
+}
+
+// -----------------------------
+// Exercises
+// -----------------------------
+
+const EQUIPMENT = [
+  { id: "none", label: "Без оборудования" },
+  { id: "dumbbells", label: "Гантели" },
+  { id: "kettlebell", label: "Гиря" },
+  { id: "bands", label: "Резинки" },
+  { id: "pullup_bar", label: "Турник" },
+  { id: "bench", label: "Скамья" },
+  { id: "barbell", label: "Штанга" },
+  { id: "cable", label: "Блочный тренажёр" },
+  { id: "machines", label: "Тренажёры" },
+];
+
+type Exercise = {
+  id: string;
+  name: string;
+  // Основная (главная) группа — используется в фильтрах и в плане
+  muscle: string;
+  // Вспомогательные группы — участвуют, но не главные
+  secondaryMuscles?: string[];
+  equip: string[];
+  tags?: string[];
+};
+
+const EXERCISES: Exercise[] = [
+  // Chest (primary: Грудь)
+  { id: "pushup", name: "Отжимания", muscle: "Грудь", secondaryMuscles: ["Плечи", "Руки", "Кор"], equip: ["none"], tags: ["база"] },
+  { id: "db_bench", name: "Жим гантелей лёжа", muscle: "Грудь", secondaryMuscles: ["Плечи", "Руки"], equip: ["dumbbells", "bench"] },
+  { id: "bb_bench", name: "Жим штанги лёжа", muscle: "Грудь", secondaryMuscles: ["Плечи", "Руки"], equip: ["barbell", "bench"] },
+  { id: "cable_fly", name: "Сведения в кроссовере", muscle: "Грудь", secondaryMuscles: ["Плечи"], equip: ["cable"] },
+
+  // Back (primary: Спина)
+  { id: "pullup", name: "Подтягивания", muscle: "Спина", secondaryMuscles: ["Руки", "Кор"], equip: ["pullup_bar"], tags: ["база"] },
+  { id: "row_db", name: "Тяга гантели в наклоне", muscle: "Спина", secondaryMuscles: ["Руки", "Кор"], equip: ["dumbbells"] },
+  { id: "lat_pulldown", name: "Тяга верхнего блока", muscle: "Спина", secondaryMuscles: ["Руки"], equip: ["cable"] },
+  { id: "inverted_row", name: "Горизонтальная тяга (под столом/в петлях)", muscle: "Спина", secondaryMuscles: ["Руки", "Кор"], equip: ["none"], tags: ["дом"] },
+
+  // Legs (primary: Ноги)
+  { id: "squat_bw", name: "Приседания (вес тела)", muscle: "Ноги", secondaryMuscles: ["Кор"], equip: ["none"] },
+  { id: "goblet", name: "Гоблет-присед", muscle: "Ноги", secondaryMuscles: ["Кор"], equip: ["dumbbells", "kettlebell"] },
+  { id: "bb_squat", name: "Присед со штангой", muscle: "Ноги", secondaryMuscles: ["Кор"], equip: ["barbell"] },
+  { id: "leg_press", name: "Жим ногами", muscle: "Ноги", secondaryMuscles: ["Кор"], equip: ["machines"] },
+  // Румынская тяга: ноги/задняя цепь, но спина/кор держат корпус
+  { id: "rdl_db", name: "Румынская тяга (гантели)", muscle: "Ноги", secondaryMuscles: ["Спина", "Кор"], equip: ["dumbbells"] },
+
+  // Shoulders (primary: Плечи)
+  { id: "pike_push", name: "Отжимания уголком", muscle: "Плечи", secondaryMuscles: ["Руки", "Кор"], equip: ["none"] },
+  { id: "ohp_db", name: "Жим гантелей над головой", muscle: "Плечи", secondaryMuscles: ["Руки", "Кор"], equip: ["dumbbells"] },
+  { id: "ohp_bb", name: "Жим штанги стоя", muscle: "Плечи", secondaryMuscles: ["Руки", "Кор"], equip: ["barbell"] },
+  { id: "lateral_raise", name: "Разведения гантелей в стороны", muscle: "Плечи", secondaryMuscles: [], equip: ["dumbbells"] },
+
+  // Arms (primary: Руки)
+  { id: "curl_db", name: "Сгибания на бицепс (гантели)", muscle: "Руки", secondaryMuscles: [], equip: ["dumbbells"] },
+  { id: "curl_band", name: "Сгибания на бицепс (резинка)", muscle: "Руки", secondaryMuscles: [], equip: ["bands"] },
+  // Дипы: обычно трицепс/грудь/плечи — упростим: руки главные
+  { id: "triceps_dip", name: "Отжимания на брусьях/стуле", muscle: "Руки", secondaryMuscles: ["Грудь", "Плечи"], equip: ["none", "bench"] },
+  { id: "pushdown", name: "Разгибания на блоке", muscle: "Руки", secondaryMuscles: [], equip: ["cable"] },
+
+  // Core (primary: Кор)
+  { id: "plank", name: "Планка", muscle: "Кор", secondaryMuscles: [], equip: ["none"] },
+  { id: "dead_bug", name: "Dead bug", muscle: "Кор", secondaryMuscles: [], equip: ["none"] },
+  { id: "hanging_knees", name: "Подъём коленей в висе", muscle: "Кор", secondaryMuscles: ["Руки"], equip: ["pullup_bar"] },
+];
+
+const SUBSTITUTIONS: Record<string, Array<{ need: string; alt: string }>> = {
+  pullup_bar: [
+    { need: "pullup", alt: "lat_pulldown" },
+    { need: "pullup", alt: "inverted_row" },
+    { need: "hanging_knees", alt: "dead_bug" },
+  ],
+  bench: [
+    { need: "db_bench", alt: "pushup" },
+    { need: "bb_bench", alt: "pushup" },
+    { need: "triceps_dip", alt: "pushdown" },
+  ],
+  barbell: [
+    { need: "bb_bench", alt: "db_bench" },
+    { need: "bb_squat", alt: "goblet" },
+    { need: "ohp_bb", alt: "ohp_db" },
+  ],
+  cable: [
+    { need: "lat_pulldown", alt: "row_db" },
+    { need: "cable_fly", alt: "pushup" },
+    { need: "pushdown", alt: "triceps_dip" },
+  ],
+};
+
+function hasAllEquipment(exercise: Exercise, available: Set<string>) {
+  if (!exercise?.equip?.length) return true;
+  if (exercise.equip.includes("none")) return true;
+  return exercise.equip.every((e) => available.has(e));
+}
+
+function resolveExercise(exId: string) {
+  return EXERCISES.find((e) => e.id === exId) || null;
+}
+
+function suggestSubstitutions({ exercise, available }: { exercise: Exercise; available: Set<string> }) {
+  const missing = (exercise?.equip || []).filter((e) => e !== "none" && !available.has(e));
+  const suggestions: Exercise[] = [];
+
+  for (const m of missing) {
+    for (const rule of SUBSTITUTIONS[m] || []) {
+      if (rule.need === exercise.id) {
+        const alt = resolveExercise(rule.alt);
+        if (alt && hasAllEquipment(alt, available)) suggestions.push(alt);
+      }
+    }
+  }
+
+  if (!suggestions.length && exercise) {
+    const same = EXERCISES.filter((e) => e.muscle === exercise.muscle && hasAllEquipment(e, available));
+    suggestions.push(...same.slice(0, 2));
+  }
+
+  return Array.from(new Map(suggestions.map((s) => [s.id, s])).values());
+}
+
+function buildWorkoutPlan({
+  daysPerWeek,
+  location,
+  availableEquipment,
+  focus,
+  cardioDays,
+}: {
+  daysPerWeek: number;
+  location: string;
+  availableEquipment: string[];
+  focus: string;
+  cardioDays: number;
+}) {
+  const days = clamp(Number(daysPerWeek) || 3, 2, 6);
+  const available = new Set(availableEquipment);
+  if (location === "gym") {
+    ["cable", "machines", "bench", "barbell", "dumbbells"].forEach((x) => available.add(x));
+  }
+
+  const pool = EXERCISES.filter((e) => hasAllEquipment(e, available));
+
+  const byMuscle: Record<string, Exercise[]> = {
+    "Грудь": pool.filter((e) => e.muscle === "Грудь"),
+    "Спина": pool.filter((e) => e.muscle === "Спина"),
+    "Ноги": pool.filter((e) => e.muscle === "Ноги"),
+    "Плечи": pool.filter((e) => e.muscle === "Плечи"),
+    "Руки": pool.filter((e) => e.muscle === "Руки"),
+    "Кор": pool.filter((e) => e.muscle === "Кор"),
+  };
+
+  const pick = (arr: Exercise[], n: number, seed = 0) => {
+    const out: Exercise[] = [];
+    if (!arr?.length) return out;
+    for (let i = 0; i < n; i++) out.push(arr[(i + seed) % arr.length]);
+    return out;
+  };
+
+  const sessions: Array<{ title: string; exercises: Array<Exercise & { prescription: string; rest: string }> }> = [];
+
+  const makeSession = (title: string, muscles: string[], seedBase: number) => {
+    const items: Exercise[] = [];
+    for (const m of muscles) {
+      const count = m === "Ноги" ? 2 : 1;
+      items.push(...pick(byMuscle[m] || [], count, seedBase + m.length));
+    }
+    items.push(...pick(byMuscle["Кор"] || [], 1, seedBase + 99));
+
+    const uniq = Array.from(new Map(items.map((x) => [x.id, x])).values());
+
+    const setRep = (ex: Exercise) => {
+      const isBase = ex.tags?.includes("база");
+      if (focus === "fat_loss") return isBase ? "3×6–10" : "3×10–15";
+      return isBase ? "4×5–8" : "3×8–12";
+    };
+
+    const list = uniq.slice(0, 7).map((ex) => ({
+      ...ex,
+      prescription: setRep(ex),
+      rest: focus === "fat_loss" ? "60–90с" : "90–150с",
+    }));
+
+    return { title, exercises: list };
+  };
+
+  if (days <= 3) {
+    const template = [
+      { title: "Full Body A", muscles: ["Ноги", "Грудь", "Спина", "Плечи", "Руки"] },
+      { title: "Full Body B", muscles: ["Ноги", "Спина", "Грудь", "Плечи", "Руки"] },
+      { title: "Full Body C", muscles: ["Ноги", "Грудь", "Спина", "Плечи", "Руки"] },
+    ];
+    for (let i = 0; i < days; i++) sessions.push(makeSession(template[i].title, template[i].muscles, i * 7));
+  } else if (days === 4) {
+    const template = [
+      { title: "Upper", muscles: ["Грудь", "Спина", "Плечи", "Руки"] },
+      { title: "Lower", muscles: ["Ноги", "Кор"] },
+      { title: "Upper", muscles: ["Грудь", "Спина", "Плечи", "Руки"] },
+      { title: "Lower", muscles: ["Ноги", "Кор"] },
+    ];
+    template.forEach((t, i) => sessions.push(makeSession(`${t.title} ${i % 2 ? "B" : "A"}`, t.muscles, i * 11)));
+  } else {
+    const template = [
+      { title: "Push", muscles: ["Грудь", "Плечи", "Руки"] },
+      { title: "Pull", muscles: ["Спина", "Руки"] },
+      { title: "Legs", muscles: ["Ноги"] },
+      { title: "Push", muscles: ["Грудь", "Плечи", "Руки"] },
+      { title: "Pull", muscles: ["Спина", "Руки"] },
+      { title: "Legs", muscles: ["Ноги"] },
+    ];
+    for (let i = 0; i < days; i++) {
+      const t = template[i];
+      sessions.push(makeSession(`${t.title} ${i < 3 ? "A" : "B"}`, t.muscles, i * 13));
+    }
+  }
+
+  const cDays = clamp(Number(cardioDays) || 0, 0, 6);
+  const cardio = {
+    recommendation:
+      focus === "fat_loss"
+        ? "20–35 мин LISS (быстрая ходьба/вело) или 10–15 мин интервалы 1–2 раза в неделю."
+        : "10–25 мин лёгкое кардио для здоровья и восстановления.",
+    days: cDays,
+  };
+
+  return { sessions, cardio, assumptions: { location, available: Array.from(available) } };
+}
+
+// -----------------------------
+// Tracker helpers
+// -----------------------------
+
+function parsePrescription(p: string) {
+  const s = String(p || "").trim();
+  const m = s.match(/([0-9]+)[ ]*[x×][ ]*([0-9]+)[ ]*[–-][ ]*([0-9]+)/i);
+  if (!m) return { sets: 3, minReps: 8, maxReps: 12 };
+  return { sets: Number(m[1]) || 3, minReps: Number(m[2]) || 8, maxReps: Number(m[3]) || 12 };
+}
+
+function incrementForExercise(ex: Exercise) {
+  const eq = new Set(ex?.equip || []);
+  if (eq.has("barbell")) return 2.5;
+  if (eq.has("dumbbells") || eq.has("kettlebell")) return 1;
+  if (eq.has("cable") || eq.has("machines")) return 2.5;
+  return 0;
+}
+
+type WorkoutEntrySet = { reps: number | null; weight: number | null };
+
+type WorkoutLog = {
+  id: string;
+  dateISO: string;
+  sessionTitle: string;
+  sessionIdx: number;
+  entries: Array<{ exerciseId: string; prescription: string; sets: WorkoutEntrySet[] }>;
+};
+
+function lastLogForExercise(workoutLogs: WorkoutLog[], exerciseId: string) {
+  const logs = (workoutLogs || []).slice().sort((a, b) => String(b.dateISO).localeCompare(String(a.dateISO)));
+  for (const log of logs) {
+    const entry = (log.entries || []).find((x) => x.exerciseId === exerciseId);
+    if (entry) return { log, entry };
+  }
+  return null;
+}
+
+function progressionHint({ ex, prescription, lastEntry }: { ex: Exercise; prescription: string; lastEntry: any }) {
+  const { minReps, maxReps } = parsePrescription(prescription);
+  const inc = incrementForExercise(ex);
+
+  if (!lastEntry?.sets?.length) {
+    return { title: "Старт", detail: `Начни с веса/варианта, где делаешь ${minReps}–${maxReps} в каждом подходе.` };
+  }
+
+  const reps = (lastEntry.sets || []).map((s: any) => Number(s.reps) || 0).filter((r: number) => r > 0);
+  const weights = (lastEntry.sets || []).map((s: any) => Number(s.weight) || 0);
+  const w = Math.max(...weights, 0);
+
+  if (!reps.length) return { title: "Продолжай", detail: `Цель: ${minReps}–${maxReps} повторов.` };
+
+  const allAtTop = reps.every((r: number) => r >= maxReps);
+  const anyBelowMin = reps.some((r: number) => r < minReps);
+
+  if (inc === 0) {
+    if (allAtTop) return { title: "Прогресс", detail: "Добавь +1–2 повтора на подход или усложни вариант." };
+    if (anyBelowMin) return { title: "Стабилизируй", detail: `Оставь сложность, добейся ${minReps}+ в каждом подходе.` };
+    return { title: "Добавляй повторы", detail: `Дотяни до ${maxReps} во всех подходах → усложняй.` };
+  }
+
+  if (allAtTop) {
+    const next = w ? w + inc : inc;
+    return { title: "Повышай вес", detail: `Сделал верх диапазона → попробуй ${next} кг (или +${inc}кг).` };
+  }
+  if (anyBelowMin) {
+    const next = w ? Math.max(0, w - inc) : 0;
+    return { title: "Снизь/оставь", detail: `Если тяжело: оставь вес или снизь до ${next} кг, цель ${minReps}+.` };
+  }
+  return { title: "Добавляй повторы", detail: `Доведи до ${maxReps} во всех подходах → затем +${inc}кг.` };
+}
+
+function workoutLogsInRange(logs: WorkoutLog[], startISO: string, endISO: string) {
+  return (logs || []).filter((l) => String(l.dateISO) >= String(startISO) && String(l.dateISO) <= String(endISO));
+}
+
+function computeWeeklyMuscleUsage(logs: WorkoutLog[], startISO: string) {
+  const endISO = addDaysISO(startISO, 6);
+  const week = workoutLogsInRange(logs, startISO, endISO);
+
+  // Считаем отдельно: главные и вспомогательные.
+  // Итоговый score нужен для сортировки/доли.
+  // Важно: это «приблизительная» метрика — не реальная физиология.
+  const map = new Map<string, { primary: number; secondary: number }>();
+
+  const add = (muscle: string, kind: "primary" | "secondary", amount: number) => {
+    if (!muscle || amount <= 0) return;
+    const cur = map.get(muscle) || { primary: 0, secondary: 0 };
+    cur[kind] += amount;
+    map.set(muscle, cur);
+  };
+
+  for (const l of week) {
+    for (const e of l.entries || []) {
+      const ex = resolveExercise(e.exerciseId);
+      if (!ex) continue;
+      const setsDone = (e.sets || []).filter((s) => s.reps !== null && s.reps !== undefined).length;
+      const setsCount = setsDone || (e.sets || []).length || 0;
+      if (!setsCount) continue;
+
+      add(ex.muscle || "Другое", "primary", setsCount);
+      for (const sm of ex.secondaryMuscles || []) add(sm, "secondary", setsCount);
+    }
+  }
+
+  // Веса: главная 1.0, вспомогательная 0.5
+  const out = Array.from(map.entries())
+    .map(([muscle, v]) => ({ muscle, primarySets: v.primary, secondarySets: v.secondary, score: v.primary + v.secondary * 0.5 }))
+    .sort((a, b) => b.score - a.score);
+
+  return { startISO, endISO, data: out };
+}
+
+// -----------------------------
+// UI helpers
+// -----------------------------
+
+function useLocalStorageState<T>(key: string, initial: T): [T, React.Dispatch<React.SetStateAction<T>>] {
+  const [state, setState] = useState<T>(() => {
+    try {
+      const raw = localStorage.getItem(key);
+      return raw ? ({ ...initial, ...(JSON.parse(raw) as any) } as T) : initial;
+    } catch {
+      return initial;
+    }
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(key, JSON.stringify(state));
+    } catch {
+      // ignore
+    }
+  }, [key, state]);
+
+  return [state, setState];
+}
+
+function Field({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
+  return (
+    <div className="grid gap-2">
+      <div className="flex items-end justify-between gap-3">
+        <Label className="text-sm">{label}</Label>
+        {hint ? <div className="text-xs text-muted-foreground">{hint}</div> : null}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function svgDataUri(svg: string) {
+  return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
+}
+
+function placeholderExerciseImage(ex: Exercise) {
+  const title = (ex?.name || "Упражнение").slice(0, 26);
+  const sub = `${ex?.muscle || ""}${ex?.secondaryMuscles?.length ? ` + ${ex.secondaryMuscles.slice(0, 2).join(", ")}` : ""}`;
+  const safe = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  // Простая оффлайн-схема. Можно заменить на реальную фотографию через URL.
+  const svg = `
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="400" viewBox="0 0 640 400">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#f4f4f5"/>
+    </linearGradient>
+  </defs>
+  <rect x="0" y="0" width="640" height="400" rx="28" fill="url(#g)" stroke="#e4e4e7"/>
+  <g fill="none" stroke="#111827" stroke-width="10" stroke-linecap="round" stroke-linejoin="round" opacity="0.9">
+    <circle cx="170" cy="140" r="28"/>
+    <path d="M170 170 L170 250" />
+    <path d="M170 200 L120 230" />
+    <path d="M170 200 L220 230" />
+    <path d="M170 250 L130 320" />
+    <path d="M170 250 L220 320" />
+    <path d="M260 310 L520 310" opacity="0.35" />
+  </g>
+  <text x="320" y="105" text-anchor="middle" font-family="ui-sans-serif, system-ui" font-size="28" fill="#111827" font-weight="700">${safe(title)}</text>
+  <text x="320" y="145" text-anchor="middle" font-family="ui-sans-serif, system-ui" font-size="16" fill="#52525b">${safe(sub)}</text>
+  <text x="320" y="370" text-anchor="middle" font-family="ui-sans-serif, system-ui" font-size="14" fill="#71717a">(Схема. Можно заменить на фото)</text>
+</svg>`;
+  return svgDataUri(svg);
+}
+
+function getExerciseImage(data: UserState, ex: Exercise) {
+  const override = data?.library?.exerciseMedia?.[ex.id];
+  return override || placeholderExerciseImage(ex);
+}
+
+function isVideoSrc(src: string) {
+  const s = String(src || "").toLowerCase();
+  return (
+    s.startsWith("data:video/") ||
+    s.endsWith(".mp4") ||
+    s.endsWith(".webm") ||
+    s.endsWith(".mov") ||
+    s.includes(".mp4?") ||
+    s.includes(".webm?") ||
+    s.includes(".mov?")
+  );
+}
+
+function ExerciseMedia({
+  src,
+  alt,
+  className,
+  mode,
+}: {
+  src: string;
+  alt: string;
+  className: string;
+  mode: "thumb" | "full";
+}) {
+  if (isVideoSrc(src)) {
+    return (
+      <video
+        className={className}
+        src={src}
+        muted
+        loop
+        playsInline
+        autoPlay={mode === "thumb"}
+        controls={mode === "full"}
+      />
+    );
+  }
+  // GIF — это обычный img, будет анимироваться автоматически
+  return <img src={src} alt={alt} className={className} />;
+}
+
+function StatPill({ title, value, sub }: { title: string; value: string; sub?: string }) {
+  return (
+    <div className="rounded-2xl border bg-background/50 p-3 shadow-sm">
+      <div className="text-xs text-muted-foreground">{title}</div>
+      <div className="text-lg font-semibold leading-tight">{value}</div>
+      {sub ? <div className="text-xs text-muted-foreground mt-1">{sub}</div> : null}
+    </div>
+  );
+}
+
+// -----------------------------
+// Multi-user data model
+// -----------------------------
+
+type NutritionActualMeal = {
+  eaten: boolean;
+  name: string;
+  kcal: number;
+  p: number;
+  f: number;
+  c: number;
+  foods?: MealFoodEntry[]; // если собрал из базы продуктов
+};
+
+type UserState = {
+  profile: { sex: string; age: number; heightCm: number; weightKg: number; activity: string };
+  goal: { loseKg: number; pace: string; focus: string };
+  training: {
+    location: string;
+    daysPerWeek: number;
+    cardioDays: number;
+    homeEquipment: Record<string, boolean>;
+    notes: string;
+  };
+  nutrition: {
+    seed: number;
+    weekStartISO: string;
+    actual: Record<string, { meals: Record<string, NutritionActualMeal> }>;
+  };
+  progress: { logs: Array<any> };
+  workouts: { logs: WorkoutLog[] };
+  // Персональная библиотека: можно переопределять картинки упражнений (URL или data:image/...)
+  library: {
+    exerciseMedia: Record<string, string>;
+  };
+};
+
+type AppState = {
+  activeUserId: string;
+  users: Array<{ id: string; name: string; state: UserState }>;
+};
+
+function makeDefaultUserState(): UserState {
+  return {
+    profile: {
+      sex: "male",
+      age: 28,
+      heightCm: 178,
+      weightKg: 82,
+      activity: "moderate",
+    },
+    goal: {
+      loseKg: 6,
+      pace: "normal",
+      focus: "fat_loss", // fat_loss | strength
+    },
+    training: {
+      location: "gym",
+      daysPerWeek: 4,
+      cardioDays: 2,
+      homeEquipment: {
+        none: true,
+        dumbbells: true,
+        kettlebell: false,
+        bands: true,
+        pullup_bar: false,
+        bench: false,
+        barbell: false,
+        cable: false,
+        machines: false,
+      },
+      notes: "",
+    },
+    nutrition: {
+      seed: 7,
+      weekStartISO: weekStartMondayISO(),
+      actual: {},
+    },
+    progress: {
+      logs: [],
+    },
+    workouts: {
+      logs: [],
+    },
+    library: {
+      exerciseMedia: {},
+    },
+  };
+}
+
+function makeId() {
+  return `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+}
+
+// -----------------------------
+// Workouts: tracker component
+// -----------------------------
+
+function WorkoutTracker({ data, setData, workoutPlan }: { data: UserState; setData: any; workoutPlan: any }) {
+  const [sessionIdx, setSessionIdx] = useState(0);
+  const [dateISO, setDateISO] = useState(() => toISODateLocal(new Date()));
+  const [draft, setDraft] = useState<Record<string, { sets: Array<{ reps: any; weight: any }> }>>({});
+
+  const sessions = workoutPlan?.sessions || [];
+  const session = sessions[sessionIdx] || sessions[0];
+
+  useEffect(() => {
+    if (!session) return;
+    const next: Record<string, { sets: Array<{ reps: any; weight: any }> }> = {};
+    for (const ex of session.exercises || []) {
+      const pr = parsePrescription(ex.prescription);
+      const last = lastLogForExercise(data.workouts?.logs || [], ex.id);
+      const lastSets = last?.entry?.sets || [];
+      next[ex.id] = {
+        sets: Array.from({ length: pr.sets }).map((_, i) => ({
+          reps: lastSets[i]?.reps ?? "",
+          weight: lastSets[i]?.weight ?? "",
+        })),
+      };
+    }
+    setDraft(next);
+  }, [sessionIdx, workoutPlan]);
+
+  const saveWorkout = () => {
+    if (!session) return;
+
+    const entries = (session.exercises || []).map((ex: any) => {
+      const sets = (draft?.[ex.id]?.sets || []).map((s) => ({
+        reps: s.reps === "" ? null : Number(s.reps),
+        weight: s.weight === "" ? null : Number(s.weight),
+      }));
+      return { exerciseId: ex.id, prescription: ex.prescription, sets };
+    });
+
+    const log: WorkoutLog = {
+      id: `${dateISO}__${session.title}__${sessionIdx}`,
+      dateISO,
+      sessionTitle: session.title,
+      sessionIdx,
+      entries,
+    };
+
+    setData((d: UserState) => {
+      const prev = d.workouts?.logs || [];
+      const filtered = prev.filter((x) => x.id !== log.id);
+      return { ...d, workouts: { ...d.workouts, logs: [log, ...filtered] } };
+    });
+  };
+
+  const logs = useMemo(
+    () => (data.workouts?.logs || []).slice().sort((a, b) => String(b.dateISO).localeCompare(String(a.dateISO))),
+    [data.workouts?.logs]
+  );
+
+  return (
+    <div className="grid gap-4">
+      <div className="grid gap-4 md:grid-cols-3">
+        <Card className="rounded-2xl shadow-sm md:col-span-2">
+          <CardHeader>
+            <CardTitle>Записать тренировку</CardTitle>
+          </CardHeader>
+          <CardContent className="grid gap-4">
+            <div className="grid gap-4 sm:grid-cols-3">
+              <Field label="Дата">
+                <Input className="rounded-xl" type="date" value={dateISO} onChange={(e) => setDateISO(e.target.value)} />
+              </Field>
+              <Field label="Сессия">
+                <Select value={String(sessionIdx)} onValueChange={(v) => setSessionIdx(Number(v))}>
+                  <SelectTrigger className="rounded-xl">
+                    <SelectValue placeholder="Выбери" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {sessions.map((s: any, i: number) => (
+                      <SelectItem key={i} value={String(i)}>{`День ${i + 1}: ${s.title}`}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </Field>
+              <div className="rounded-2xl border bg-muted/30 p-3">
+                <div className="text-sm font-medium">Авто-прогрессия</div>
+                <div className="text-xs text-muted-foreground">Подсказки — по последней записи упражнения.</div>
+              </div>
+            </div>
+
+            {session ? (
+              <div className="grid gap-3">
+                {(session.exercises || []).map((ex: any) => {
+                  const pr = parsePrescription(ex.prescription);
+                  const last = lastLogForExercise(data.workouts?.logs || [], ex.id);
+                  const hint = progressionHint({ ex, prescription: ex.prescription, lastEntry: last?.entry });
+                  const usesWeight = incrementForExercise(ex) > 0;
+
+                  return (
+                    <div key={ex.id} className="rounded-2xl border p-3">
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="flex items-start gap-3">
+                          <div className="rounded-xl overflow-hidden border bg-muted/20 shrink-0">
+                            <img src={getExerciseImage(data, ex)} alt={ex.name} className="h-14 w-20 object-cover" />
+                          </div>
+                          <div>
+                            <div className="text-sm font-medium">{ex.name}</div>
+                            <div className="text-xs text-muted-foreground">
+                              Главная: {ex.muscle}
+                              {ex.secondaryMuscles?.length ? ` · Вспомог.: ${ex.secondaryMuscles.join(", ")}` : ""}
+                              {` · ${ex.prescription}`}
+                            </div>
+                          </div>
+                        </div>
+                          <div className="mt-2 text-xs">
+                            <span className="font-medium">{hint.title}:</span> <span className="text-muted-foreground">{hint.detail}</span>
+                          </div>
+                          {last?.log ? (
+                            <div className="mt-2 text-xs text-muted-foreground">
+                              Последний раз: {last.log.dateISO} · {(last.entry.sets || []).map((s: any) => `${s.weight ?? "—"}кг×${s.reps ?? "—"}`).join(" · ")}
+                            </div>
+                          ) : null}
+                        </div>
+                        <div className="flex flex-wrap gap-1 justify-end">
+                          {(ex.equip || []).map((e: string) => (
+                            <Badge key={e} variant="outline" className="rounded-xl">{EQUIPMENT.find((x) => x.id === e)?.label || e}</Badge>
+                          ))}
+                        </div>
+                      </div>
+
+                      <div className="mt-3 grid gap-2">
+                        {Array.from({ length: pr.sets }).map((_, si) => {
+                          const set = draft?.[ex.id]?.sets?.[si] || { reps: "", weight: "" };
+                          return (
+                            <div key={si} className="grid grid-cols-12 gap-2 items-end">
+                              <div className="col-span-12 sm:col-span-2 text-sm text-muted-foreground">Подход {si + 1}</div>
+                              <div className="col-span-6 sm:col-span-5">
+                                <Label className="text-xs">Повторы</Label>
+                                <Input
+                                  className="rounded-xl"
+                                  type="number"
+                                  value={set.reps}
+                                  onChange={(e) => {
+                                    const v = e.target.value;
+                                    setDraft((d) => ({
+                                      ...d,
+                                      [ex.id]: {
+                                        sets: (d?.[ex.id]?.sets || []).map((x: any, j: number) => (j === si ? { ...x, reps: v } : x)),
+                                      },
+                                    }));
+                                  }}
+                                />
+                              </div>
+                              <div className="col-span-6 sm:col-span-5">
+                                <Label className="text-xs">Вес {usesWeight ? "(кг)" : "(опц.)"}</Label>
+                                <Input
+                                  className="rounded-xl"
+                                  type="number"
+                                  value={set.weight}
+                                  onChange={(e) => {
+                                    const v = e.target.value;
+                                    setDraft((d) => ({
+                                      ...d,
+                                      [ex.id]: {
+                                        sets: (d?.[ex.id]?.sets || []).map((x: any, j: number) => (j === si ? { ...x, weight: v } : x)),
+                                      },
+                                    }));
+                                  }}
+                                />
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            ) : (
+              <div className="text-sm text-muted-foreground">Нет сессий в плане — увеличь дни тренировок.</div>
+            )}
+
+            <div className="flex flex-wrap gap-2">
+              <Button className="rounded-xl" onClick={saveWorkout}>Сохранить тренировку</Button>
+              <Button
+                className="rounded-xl"
+                variant="secondary"
+                onClick={() => {
+                  if (!session) return;
+                  const next: any = {};
+                  for (const ex of session.exercises || []) {
+                    const pr = parsePrescription(ex.prescription);
+                    next[ex.id] = { sets: Array.from({ length: pr.sets }).map(() => ({ reps: "", weight: "" })) };
+                  }
+                  setDraft(next);
+                }}
+              >
+                Очистить
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card className="rounded-2xl shadow-sm">
+          <CardHeader>
+            <CardTitle>История</CardTitle>
+          </CardHeader>
+          <CardContent className="grid gap-3">
+            <div className="text-sm text-muted-foreground">Логи сохраняются в браузере (localStorage) и привязаны к профилю.</div>
+            <div className="grid gap-2">
+              {logs.slice(0, 12).map((l) => (
+                <div key={l.id} className="rounded-2xl border p-3">
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <div className="text-sm font-medium">{l.dateISO}</div>
+                      <div className="text-xs text-muted-foreground">{l.sessionTitle}</div>
+                    </div>
+                    <Button
+                      variant="secondary"
+                      className="rounded-xl"
+                      onClick={() =>
+                        setData((d: UserState) => ({
+                          ...d,
+                          workouts: { ...d.workouts, logs: (d.workouts?.logs || []).filter((x) => x.id !== l.id) },
+                        }))
+                      }
+                    >
+                      Удалить
+                    </Button>
+                  </div>
+                  <div className="mt-2 text-xs text-muted-foreground">
+                    {(l.entries || []).slice(0, 3).map((e) => {
+                      const ex = resolveExercise(e.exerciseId);
+                      const line = (e.sets || []).map((s) => `${s.weight ?? "—"}кг×${s.reps ?? "—"}`).join(" · ");
+                      return (
+                        <div key={e.exerciseId}>
+                          {(ex?.name || e.exerciseId)}: {line}
+                        </div>
+                      );
+                    })}
+                    {(l.entries || []).length > 3 ? <div>…</div> : null}
+                  </div>
+                </div>
+              ))}
+              {!logs.length ? <div className="text-sm text-muted-foreground">Пока пусто. Сохрани первую тренировку 🙂</div> : null}
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+
+      <div className="text-xs text-muted-foreground">Правило: добил верх диапазона во всех подходах → прибавь вес. Не добил низ → оставь/чуть снизь.</div>
+    </div>
+  );
+}
+
+function WeeklyMuscleReport({ data }: { data: UserState }) {
+  const startISO = data.nutrition.weekStartISO || weekStartMondayISO();
+  const report = useMemo(() => computeWeeklyMuscleUsage(data.workouts.logs || [], startISO), [data.workouts.logs, startISO]);
+
+  const totalScore = report.data.reduce((acc, x: any) => acc + (Number(x.score) || 0), 0);
+
+  const chartData = report.data.map((x: any) => ({
+    muscle: x.muscle,
+    primarySets: x.primarySets,
+    secondarySets: x.secondarySets,
+    score: round(x.score, 1),
+    share: totalScore ? Math.round((x.score / totalScore) * 100) : 0,
+  }));
+
+  return (
+    <div className="grid gap-4 md:grid-cols-2">
+      <Card className="rounded-2xl shadow-sm">
+        <CardHeader>
+          <CardTitle>Нагрузка по мышцам за неделю</CardTitle>
+        </CardHeader>
+        <CardContent className="grid gap-3">
+          <div className="rounded-2xl border bg-muted/30 p-3 text-sm">
+            Неделя: <span className="font-medium">{report.startISO}</span> → <span className="font-medium">{report.endISO}</span>
+            <div className="text-xs text-muted-foreground mt-1">
+              Главные/вспомогательные мышцы считаются по каждому упражнению из лога. Для доли используем вес: главная×1.0, вспомогательная×0.5.
+            </div>
+          </div>
+
+          <div className="h-72">
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart data={chartData} margin={{ top: 10, right: 20, bottom: 0, left: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="muscle" tick={{ fontSize: 12 }} interval={0} />
+                <YAxis tick={{ fontSize: 12 }} />
+                <Tooltip />
+                <Legend />
+                <Bar dataKey="primarySets" name="Главная (подходы)" stackId="a" />
+                <Bar dataKey="secondarySets" name="Вспомогательная (подходы)" stackId="a" />
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+
+          {!chartData.length ? <div className="text-sm text-muted-foreground">За эту неделю нет тренировочных логов.</div> : null}
+        </CardContent>
+      </Card>
+
+      <Card className="rounded-2xl shadow-sm">
+        <CardHeader>
+          <CardTitle>Сводка</CardTitle>
+        </CardHeader>
+        <CardContent className="grid gap-3">
+          <div className="text-sm text-muted-foreground">Главные/вспомогательные подходы и доля (по score).</div>
+          <div className="rounded-2xl border p-3 grid gap-2">
+            {chartData.map((x: any) => (
+              <div key={x.muscle} className="flex items-center justify-between gap-3">
+                <div className="text-sm font-medium">{x.muscle}</div>
+                <div className="text-sm text-muted-foreground">
+                  {x.primarySets} главн · {x.secondarySets} вспом · {x.share}%
+                </div>
+              </div>
+            ))}
+            {!chartData.length ? <div className="text-sm text-muted-foreground">Пока пусто.</div> : null}
+          </div>
+
+          <div className="rounded-2xl border bg-muted/30 p-3 text-xs text-muted-foreground">
+            Чтобы отчёт работал — записывай тренировки в «Трекере». Метрика помогает увидеть перекосы (например, мало ног/спины).
+          </div>
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
+// -----------------------------
+// Nutrition helpers: actual meals
+// -----------------------------
+
+function ensureActualMealEntry(
+  actual: UserState["nutrition"]["actual"],
+  dateISO: string,
+  slot: string,
+  planned: { name: string; kcal: number; p: number; f: number; c: number }
+) {
+  const day = actual[dateISO] || { meals: {} as Record<string, NutritionActualMeal> };
+  const meal = day.meals[slot];
+  if (meal) return { ...actual, [dateISO]: day };
+  return {
+    ...actual,
+    [dateISO]: {
+      meals: {
+        ...day.meals,
+        [slot]: {
+          eaten: true,
+          name: planned.name,
+          kcal: planned.kcal,
+          p: planned.p,
+          f: planned.f,
+          c: planned.c,
+          foods: [],
+        },
+      },
+    },
+  };
+}
+
+function computeActualTotals(plannedDay: PlannedDay, actualDay: { meals: Record<string, NutritionActualMeal> } | undefined) {
+  if (!actualDay || !Object.keys(actualDay.meals || {}).length) return plannedDay.totals;
+
+  const sum = { kcal: 0, p: 0, f: 0, c: 0 };
+
+  for (const m of plannedDay.meals) {
+    const a = actualDay.meals[m.slot];
+    if (!a) {
+      sum.kcal += m.kcal || 0;
+      sum.p += m.p || 0;
+      sum.f += m.f || 0;
+      sum.c += m.c || 0;
+      continue;
+    }
+    if (!a.eaten) continue;
+    sum.kcal += Number(a.kcal) || 0;
+    sum.p += Number(a.p) || 0;
+    sum.f += Number(a.f) || 0;
+    sum.c += Number(a.c) || 0;
+  }
+
+  return { kcal: Math.round(sum.kcal), p: Math.round(sum.p), f: Math.round(sum.f), c: Math.round(sum.c) };
+}
+
+// -----------------------------
+// Food composer UI
+// -----------------------------
+
+function FoodComposer({
+  foods,
+  onChange,
+  onApply,
+}: {
+  foods: MealFoodEntry[];
+  onChange: (next: MealFoodEntry[]) => void;
+  onApply: () => void;
+}) {
+  const [q, setQ] = useState("");
+  const [selectedId, setSelectedId] = useState(FOOD_DB[0]?.id || "");
+  const [grams, setGrams] = useState("100");
+
+  const filtered = useMemo(() => {
+    const s = q.trim().toLowerCase();
+    if (!s) return FOOD_DB;
+    return FOOD_DB.filter((f) => f.name.toLowerCase().includes(s));
+  }, [q]);
+
+  const preview = useMemo(() => computeMealFromFoods(foods || []), [foods]);
+
+  return (
+    <div className="grid gap-3">
+      <div className="rounded-2xl border bg-muted/20 p-3">
+        <div className="text-sm font-medium">Собрать из продуктов</div>
+        <div className="text-xs text-muted-foreground mt-1">Выбери продукт, задай граммы, добавь. Затем «Применить».</div>
+
+        <div className="mt-3 grid gap-3 sm:grid-cols-3">
+          <Field label="Поиск" hint="по базе">
+            <Input className="rounded-xl" value={q} onChange={(e) => setQ(e.target.value)} placeholder="курица, рис, творог…" />
+          </Field>
+
+          <Field label="Продукт">
+            <Select value={selectedId} onValueChange={setSelectedId}>
+              <SelectTrigger className="rounded-xl"><SelectValue placeholder="Выбери" /></SelectTrigger>
+              <SelectContent>
+                {filtered.slice(0, 30).map((f) => (
+                  <SelectItem key={f.id} value={f.id}>{f.name}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </Field>
+
+          <Field label="Граммы">
+            <Input className="rounded-xl" type="number" value={grams} onChange={(e) => setGrams(e.target.value)} />
+          </Field>
+        </div>
+
+        <div className="mt-3 flex flex-wrap gap-2">
+          <Button
+            className="rounded-xl"
+            variant="secondary"
+            onClick={() => {
+              const g = Number(grams);
+              if (!selectedId || !g || g <= 0) return;
+              onChange([...(foods || []), { foodId: selectedId, grams: g }]);
+            }}
+          >
+            + Добавить
+          </Button>
+
+          <Button
+            className="rounded-xl"
+            variant="secondary"
+            onClick={() => onChange([])}
+          >
+            Очистить продукты
+          </Button>
+
+          <Button className="rounded-xl" onClick={onApply}>
+            Применить к приёму
+          </Button>
+        </div>
+
+        <div className="mt-3 rounded-2xl border p-3 grid gap-2">
+          <div className="text-sm font-medium">Состав</div>
+          {(foods || []).map((e, i) => {
+            const f = foodById(e.foodId);
+            const m = f ? macrosFromFood(f, e.grams) : null;
+            return (
+              <div key={`${e.foodId}_${i}`} className="flex items-center justify-between gap-3">
+                <div className="text-sm">{f?.name || e.foodId} · {Math.round(e.grams)}г</div>
+                <div className="flex items-center gap-2">
+                  <div className="text-xs text-muted-foreground">{m ? `${m.kcal}ккал ${m.p}P/${m.f}F/${m.c}C` : "—"}</div>
+                  <Button
+                    className="rounded-xl"
+                    size="sm"
+                    variant="secondary"
+                    onClick={() => onChange((foods || []).filter((_, j) => j !== i))}
+                  >
+                    Удалить
+                  </Button>
+                </div>
+              </div>
+            );
+          })}
+          {!(foods || []).length ? <div className="text-sm text-muted-foreground">Пока пусто.</div> : null}
+        </div>
+
+        <div className="mt-3 flex flex-wrap gap-2">
+          <Badge variant="secondary">Итого: {preview.kcal} ккал</Badge>
+          <Badge variant="outline">{preview.p}P</Badge>
+          <Badge variant="outline">{preview.f}F</Badge>
+          <Badge variant="outline">{preview.c}C</Badge>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// -----------------------------
+// App
+// -----------------------------
+
+export default function App() {
+  const [app, setApp] = useLocalStorageState<AppState>(STORAGE_KEY, {
+    activeUserId: "u1",
+    users: [
+      {
+        id: "u1",
+        name: "Профиль 1",
+        state: makeDefaultUserState(),
+      },
+    ],
+  });
+
+  const activeUser = useMemo(() => {
+    const found = app.users.find((u) => u.id === app.activeUserId);
+    return found || app.users[0];
+  }, [app.activeUserId, app.users]);
+
+  const data = activeUser?.state as UserState;
+
+  const setData = (updater: any) => {
+    setApp((prev) => {
+      const users = prev.users.map((u) => {
+        if (u.id !== prev.activeUserId) return u;
+        const nextState = typeof updater === "function" ? updater(u.state) : updater;
+        return { ...u, state: nextState };
+      });
+      return { ...prev, users };
+    });
+  };
+
+  // --- user management ---
+  const addUser = () => {
+    const name = prompt("Имя профиля (например: Алекс)")?.trim();
+    if (!name) return;
+    const id = makeId();
+    setApp((prev) => ({
+      ...prev,
+      activeUserId: id,
+      users: [...prev.users, { id, name, state: makeDefaultUserState() }],
+    }));
+  };
+
+  const deleteUser = () => {
+    if (app.users.length <= 1) return;
+    const ok = confirm(`Удалить профиль «${activeUser.name}»?`);
+    if (!ok) return;
+    setApp((prev) => {
+      const remaining = prev.users.filter((u) => u.id !== prev.activeUserId);
+      const nextActive = remaining[0]?.id || "";
+      return { ...prev, activeUserId: nextActive, users: remaining };
+    });
+  };
+
+  const renameUser = () => {
+    const name = prompt("Новое имя профиля", activeUser.name)?.trim();
+    if (!name) return;
+    setApp((prev) => ({
+      ...prev,
+      users: prev.users.map((u) => (u.id === prev.activeUserId ? { ...u, name } : u)),
+    }));
+  };
+
+  // --- derived numbers ---
+
+  const bmr = useMemo(() => calcBMR(data.profile as any), [data.profile]);
+  const tdee = useMemo(() => (bmr ? bmr * activityFactor(data.profile.activity) : 0), [bmr, data.profile.activity]);
+
+  const deficitKcalPerDay = useMemo(() => {
+    const rate = paceToKgPerWeek(data.goal.pace);
+    const daily = (rate * 7700) / 7;
+    return clamp(daily, 250, 1000);
+  }, [data.goal.pace]);
+
+  const caloriesTarget = useMemo(() => {
+    if (!tdee) return 2000;
+    const target = data.goal.focus === "fat_loss" ? tdee - deficitKcalPerDay : tdee + 150;
+    const floor = data.profile.sex === "female" ? 1300 : 1500;
+    return Math.round(clamp(target, floor, 3500));
+  }, [tdee, deficitKcalPerDay, data.goal.focus, data.profile.sex]);
+
+  const macros = useMemo(
+    () => macroTargets({ weightKg: data.profile.weightKg, caloriesTarget, focus: data.goal.focus }),
+    [data.profile.weightKg, caloriesTarget, data.goal.focus]
+  );
+
+  const forecast = useMemo(
+    () =>
+      estimateWeeklyForecast({
+        currentWeightKg: data.profile.weightKg,
+        loseKg: data.goal.loseKg,
+        pace: data.goal.pace,
+      }),
+    [data.profile.weightKg, data.goal.loseKg, data.goal.pace]
+  );
+
+  const weekStartISO = data.nutrition.weekStartISO || weekStartMondayISO();
+
+  const menu = useMemo(
+    () => generateWeeklyMenu({ caloriesTarget, seed: Number(data.nutrition.seed) || 1, weekStartISO }),
+    [caloriesTarget, data.nutrition.seed, weekStartISO]
+  );
+
+  const shoppingList = useMemo(() => buildShoppingList(menu), [menu]);
+
+  const availableEquipment = useMemo(() => {
+    const eq = new Set<string>();
+    for (const [k, v] of Object.entries(data.training.homeEquipment || {})) {
+      if (v) eq.add(k);
+    }
+    return Array.from(eq);
+  }, [data.training.homeEquipment]);
+
+  const workoutPlan = useMemo(() => {
+    return buildWorkoutPlan({
+      daysPerWeek: data.training.daysPerWeek,
+      location: data.training.location,
+      availableEquipment,
+      focus: data.goal.focus,
+      cardioDays: data.training.cardioDays,
+    });
+  }, [data.training.daysPerWeek, data.training.location, availableEquipment, data.goal.focus, data.training.cardioDays]);
+
+  const progressSeries = useMemo(() => {
+    const logs = (data.progress.logs || []).slice().sort((a: any, b: any) => String(a.dateISO).localeCompare(String(b.dateISO)));
+    return logs.map((l: any) => ({
+      date: l.dateISO,
+      weight: Number(l.weightKg) || null,
+      waist: Number(l.waistCm) || null,
+      chest: Number(l.chestCm) || null,
+      hip: Number(l.hipCm) || null,
+    }));
+  }, [data.progress.logs]);
+
+  const lastLog = useMemo(() => {
+    const logs = data.progress.logs || [];
+    if (!logs.length) return null;
+    return logs.slice().sort((a: any, b: any) => String(b.dateISO).localeCompare(String(a.dateISO)))[0];
+  }, [data.progress.logs]);
+
+  const [newLog, setNewLog] = useState(() => {
+    const iso = toISODateLocal(new Date());
+    return { dateISO: iso, weightKg: "", waistCm: "", chestCm: "", hipCm: "" };
+  });
+
+  const addLog = () => {
+    if (!newLog.dateISO) return;
+    const entry = {
+      dateISO: newLog.dateISO,
+      weightKg: newLog.weightKg === "" ? null : Number(newLog.weightKg),
+      waistCm: newLog.waistCm === "" ? null : Number(newLog.waistCm),
+      chestCm: newLog.chestCm === "" ? null : Number(newLog.chestCm),
+      hipCm: newLog.hipCm === "" ? null : Number(newLog.hipCm),
+    };
+
+    setData((d: UserState) => {
+      const logs = (d.progress.logs || []).filter((x: any) => x.dateISO !== entry.dateISO);
+      logs.push(entry);
+      return { ...d, progress: { ...d.progress, logs } };
+    });
+  };
+
+  const resetAll = () => {
+    const ok = confirm("Сбросить все профили и данные?");
+    if (!ok) return;
+    localStorage.removeItem(STORAGE_KEY);
+    location.reload();
+  };
+
+  const headerStats = useMemo(() => {
+    const weeks = forecast.length ? forecast.length - 1 : 0;
+    const estEnd = forecast.length ? forecast[forecast.length - 1].weight : null;
+    return {
+      bmr: bmr ? `${Math.round(bmr)} ккал` : "—",
+      tdee: tdee ? `${Math.round(tdee)} ккал` : "—",
+      target: `${caloriesTarget} ккал`,
+      macros: macros.p ? `${macros.p}P / ${macros.f}F / ${macros.c}C` : "—",
+      weeks: weeks ? `${weeks} нед` : "—",
+      end: estEnd ? `${estEnd} кг` : "—",
+    };
+  }, [bmr, tdee, caloriesTarget, forecast, macros]);
+
+  const regenMenu = () => {
+    setData((d: UserState) => ({ ...d, nutrition: { ...d.nutrition, seed: (Number(d.nutrition.seed) || 1) + 1 } }));
+  };
+
+  const setWeekStart = (iso: string) => {
+    setData((d: UserState) => ({ ...d, nutrition: { ...d.nutrition, weekStartISO: iso } }));
+  };
+
+  return (
+    <div className="min-h-screen bg-gradient-to-b from-background to-muted/30">
+      <div className="mx-auto max-w-6xl p-4 md:p-8 grid gap-6">
+        <div className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
+          <div>
+            <div className="text-2xl md:text-3xl font-semibold tracking-tight">Спортивный тренер-планировщик</div>
+            <div className="text-sm text-muted-foreground mt-1">Меню (план+факт) · тренировки · анализ недели · несколько профилей.</div>
+          </div>
+
+          <div className="flex flex-col sm:flex-row gap-2 items-start sm:items-center">
+            <div className="flex gap-2 items-center flex-wrap">
+              <Select value={app.activeUserId} onValueChange={(v) => setApp((p) => ({ ...p, activeUserId: v }))}>
+                <SelectTrigger className="rounded-xl w-44"><SelectValue placeholder="Профиль" /></SelectTrigger>
+                <SelectContent>
+                  {app.users.map((u) => (
+                    <SelectItem key={u.id} value={u.id}>{u.name}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <Button variant="secondary" className="rounded-xl" onClick={addUser}>+ Профиль</Button>
+              <Button variant="secondary" className="rounded-xl" onClick={renameUser}>Переимен.</Button>
+              <Button variant="secondary" className="rounded-xl" onClick={deleteUser} disabled={app.users.length <= 1}>Удалить</Button>
+            </div>
+
+            <Button variant="secondary" className="rounded-xl" onClick={resetAll}>Сброс всё</Button>
+          </div>
+        </div>
+
+        <div className="grid gap-3 md:grid-cols-6">
+          <StatPill title="BMR" value={headerStats.bmr} sub="базовый обмен" />
+          <StatPill title="TDEE" value={headerStats.tdee} sub="поддержание" />
+          <StatPill title="Цель калорий" value={headerStats.target} sub={data.goal.focus === "fat_loss" ? "дефицит" : "набор/сила"} />
+          <StatPill title="Цель БЖУ" value={headerStats.macros} sub="г/день" />
+          <StatPill title="Прогноз" value={headerStats.weeks} sub="до цели" />
+          <StatPill title="Ожидаемый вес" value={headerStats.end} sub="по прогнозу" />
+        </div>
+
+        <Tabs defaultValue="profile" className="w-full">
+          <TabsList className="w-full flex flex-wrap justify-start">
+            <TabsTrigger value="profile">Профиль & цель</TabsTrigger>
+            <TabsTrigger value="nutrition">Меню</TabsTrigger>
+            <TabsTrigger value="workouts">Тренировки</TabsTrigger>
+            <TabsTrigger value="progress">Прогресс</TabsTrigger>
+            <TabsTrigger value="exercises">База упражнений</TabsTrigger>
+          </TabsList>
+
+          {/* PROFILE */}
+          <TabsContent value="profile" className="mt-4">
+            <div className="grid gap-4 md:grid-cols-2">
+              <Card className="rounded-2xl shadow-sm">
+                <CardHeader><CardTitle>Профиль</CardTitle></CardHeader>
+                <CardContent className="grid gap-4">
+                  <div className="rounded-2xl border bg-muted/30 p-3 text-sm">
+                    <div className="font-medium">Мини-онбординг</div>
+                    <div className="text-xs text-muted-foreground mt-1">1) возраст/рост/вес → 2) активность → 3) цель.</div>
+                  </div>
+
+                  <div className="grid gap-4 sm:grid-cols-2">
+                    <Field label="Пол">
+                      <Select value={data.profile.sex} onValueChange={(v) => setData((d: UserState) => ({ ...d, profile: { ...d.profile, sex: v } }))}>
+                        <SelectTrigger className="rounded-xl"><SelectValue placeholder="Выбери" /></SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="male">Мужской</SelectItem>
+                          <SelectItem value="female">Женский</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </Field>
+
+                    <Field label="Возраст">
+                      <Input className="rounded-xl" type="number" value={data.profile.age} onChange={(e) => setData((d: UserState) => ({ ...d, profile: { ...d.profile, age: Number(e.target.value) } }))} />
+                    </Field>
+
+                    <Field label="Рост (см)">
+                      <Input className="rounded-xl" type="number" value={data.profile.heightCm} onChange={(e) => setData((d: UserState) => ({ ...d, profile: { ...d.profile, heightCm: Number(e.target.value) } }))} />
+                    </Field>
+
+                    <Field label="Вес (кг)">
+                      <Input className="rounded-xl" type="number" value={data.profile.weightKg} onChange={(e) => setData((d: UserState) => ({ ...d, profile: { ...d.profile, weightKg: Number(e.target.value) } }))} />
+                    </Field>
+                  </div>
+
+                  <Field label="Активность" hint="вне тренировок (работа/шаги)">
+                    <Select value={data.profile.activity} onValueChange={(v) => setData((d: UserState) => ({ ...d, profile: { ...d.profile, activity: v } }))}>
+                      <SelectTrigger className="rounded-xl"><SelectValue placeholder="Выбери" /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="sedentary">Сидячая</SelectItem>
+                        <SelectItem value="light">Лёгкая</SelectItem>
+                        <SelectItem value="moderate">Средняя</SelectItem>
+                        <SelectItem value="high">Высокая</SelectItem>
+                        <SelectItem value="athlete">Спортсмен/очень высокая</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </Field>
+
+                  <div className="rounded-2xl border bg-muted/30 p-3 text-sm">
+                    <div className="flex flex-wrap gap-2 items-center">
+                      <Badge variant="secondary">BMR ≈ {headerStats.bmr}</Badge>
+                      <Badge variant="secondary">TDEE ≈ {headerStats.tdee}</Badge>
+                      <Badge variant="secondary">Цель ≈ {headerStats.target}</Badge>
+                      <Badge variant="secondary">БЖУ ≈ {headerStats.macros}</Badge>
+                    </div>
+                    <div className="text-xs text-muted-foreground mt-2">Если вес стоит 2+ недели — корректируем калории или шаги.</div>
+                  </div>
+                </CardContent>
+              </Card>
+
+              <Card className="rounded-2xl shadow-sm">
+                <CardHeader><CardTitle>Цель</CardTitle></CardHeader>
+                <CardContent className="grid gap-4">
+                  <div className="grid gap-4 sm:grid-cols-2">
+                    <Field label="Хочу похудеть на (кг)">
+                      <Input className="rounded-xl" type="number" value={data.goal.loseKg} onChange={(e) => setData((d: UserState) => ({ ...d, goal: { ...d.goal, loseKg: Number(e.target.value) } }))} />
+                    </Field>
+                    <Field label="Темп">
+                      <Select value={data.goal.pace} onValueChange={(v) => setData((d: UserState) => ({ ...d, goal: { ...d.goal, pace: v } }))}>
+                        <SelectTrigger className="rounded-xl"><SelectValue placeholder="Выбери" /></SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="conservative">Спокойно (≈0.35 кг/нед)</SelectItem>
+                          <SelectItem value="normal">Норм (≈0.6 кг/нед)</SelectItem>
+                          <SelectItem value="aggressive">Агрессивно (≈0.9 кг/нед)</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </Field>
+                  </div>
+
+                  <Field label="Фокус">
+                    <div className="flex flex-wrap gap-2">
+                      <Button variant={data.goal.focus === "fat_loss" ? "default" : "secondary"} className="rounded-xl" onClick={() => setData((d: UserState) => ({ ...d, goal: { ...d.goal, focus: "fat_loss" } }))}>Похудение</Button>
+                      <Button variant={data.goal.focus === "strength" ? "default" : "secondary"} className="rounded-xl" onClick={() => setData((d: UserState) => ({ ...d, goal: { ...d.goal, focus: "strength" } }))}>Сила/форма</Button>
+                    </div>
+                  </Field>
+
+                  <Separator />
+
+                  <div className="grid gap-2">
+                    <div className="text-sm font-medium">Прогноз веса по неделям</div>
+                    {forecast?.length ? (
+                      <div className="h-64 w-full">
+                        <ResponsiveContainer width="100%" height="100%">
+                          <LineChart data={forecast} margin={{ top: 10, right: 20, bottom: 0, left: 0 }}>
+                            <CartesianGrid strokeDasharray="3 3" />
+                            <XAxis dataKey="week" tick={{ fontSize: 12 }} interval="preserveStartEnd" />
+                            <YAxis domain={["dataMin - 1", "dataMax + 1"]} tick={{ fontSize: 12 }} />
+                            <Tooltip />
+                            <Line type="monotone" dataKey="weight" dot={false} />
+                          </LineChart>
+                        </ResponsiveContainer>
+                      </div>
+                    ) : (
+                      <div className="text-sm text-muted-foreground">Введи вес и цель (кг), чтобы увидеть прогноз.</div>
+                    )}
+                    <div className="text-xs text-muted-foreground">Это оценка. Реальность будет «волнами» из воды/сна/стресса.</div>
+                  </div>
+                </CardContent>
+              </Card>
+            </div>
+          </TabsContent>
+
+          {/* NUTRITION */}
+          <TabsContent value="nutrition" className="mt-4">
+            <div className="grid gap-4 md:grid-cols-2">
+              <Card className="rounded-2xl shadow-sm">
+                <CardHeader><CardTitle>Меню на неделю (план + факт)</CardTitle></CardHeader>
+                <CardContent className="grid gap-4">
+                  <div className="rounded-2xl border bg-muted/30 p-3 text-sm">
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div>
+                        Цель: <span className="font-semibold">{caloriesTarget} ккал/день</span>
+                        <div className="text-xs text-muted-foreground mt-1">БЖУ цель: {macros.p}P / {macros.f}F / {macros.c}C</div>
+                      </div>
+                      <div className="flex gap-2">
+                        <Button className="rounded-xl" variant="secondary" onClick={regenMenu}>Перегенерировать</Button>
+                      </div>
+                    </div>
+
+                    <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                      <Field label="Неделя (понедельник)">
+                        <Input className="rounded-xl" type="date" value={weekStartISO} onChange={(e) => setWeekStart(e.target.value)} />
+                      </Field>
+                      <div className="rounded-2xl border p-3">
+                        <div className="text-sm font-medium">Факт по еде</div>
+                        <div className="text-xs text-muted-foreground">Кнопка «Факт» → можно собрать приём из базы продуктов.</div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <NutritionWeek menu={menu} caloriesTarget={caloriesTarget} data={data} setData={setData} />
+                </CardContent>
+              </Card>
+
+              <Card className="rounded-2xl shadow-sm">
+                <CardHeader><CardTitle>Список покупок на неделю</CardTitle></CardHeader>
+                <CardContent className="grid gap-3">
+                  <div className="text-sm text-muted-foreground">Список покупок строится из планового меню (не из факта).</div>
+                  <div className="rounded-2xl border p-3">
+                    <div className="grid gap-2">
+                      {shoppingList.map((it) => (
+                        <div key={it.name + it.unit} className="flex items-center justify-between gap-3">
+                          <div className="text-sm">{it.name}</div>
+                          <div className="text-sm text-muted-foreground">{formatShoppingQty(it.qty, it.unit)}</div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="grid gap-2 sm:grid-cols-2">
+                    <Button
+                      className="rounded-xl"
+                      onClick={() => {
+                        const text = shoppingList.map((it) => `- ${it.name}: ${formatShoppingQty(it.qty, it.unit)}`).join(NL);
+                        navigator.clipboard?.writeText(text);
+                      }}
+                    >
+                      Скопировать список
+                    </Button>
+                    <Button
+                      className="rounded-xl"
+                      variant="secondary"
+                      onClick={() => {
+                        const text = menu
+                          .map((d) => {
+                            const lines = d.meals
+                              .map((m) => `  • ${m.slot}: ${m.name} (${m.kcal}ккал, ${m.p}P/${m.f}F/${m.c}C)`)
+                              .join(NL);
+                            return `${d.day} (${d.dateISO}) — ${d.totals.kcal}ккал (${d.totals.p}P/${d.totals.f}F/${d.totals.c}C)` + NL + lines;
+                          })
+                          .join(NL2);
+                        navigator.clipboard?.writeText(text);
+                      }}
+                    >
+                      Скопировать меню
+                    </Button>
+                  </div>
+                </CardContent>
+              </Card>
+            </div>
+          </TabsContent>
+
+          {/* WORKOUTS */}
+          <TabsContent value="workouts" className="mt-4">
+            <Tabs defaultValue="plan" className="w-full">
+              <TabsList className="w-full flex flex-wrap justify-start">
+                <TabsTrigger value="plan">План</TabsTrigger>
+                <TabsTrigger value="tracker">Трекер</TabsTrigger>
+                <TabsTrigger value="week">Итоги недели</TabsTrigger>
+              </TabsList>
+
+              <TabsContent value="plan" className="mt-4">
+                <div className="grid gap-4 md:grid-cols-2">
+                  <Card className="rounded-2xl shadow-sm">
+                    <CardHeader><CardTitle>Параметры тренировок</CardTitle></CardHeader>
+                    <CardContent className="grid gap-4">
+                      <div className="grid gap-4 sm:grid-cols-2">
+                        <Field label="Где тренируюсь">
+                          <Select value={data.training.location} onValueChange={(v) => setData((d: UserState) => ({ ...d, training: { ...d.training, location: v } }))}>
+                            <SelectTrigger className="rounded-xl"><SelectValue placeholder="Выбери" /></SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value="gym">В зале</SelectItem>
+                              <SelectItem value="home">Дома</SelectItem>
+                            </SelectContent>
+                          </Select>
+                        </Field>
+                        <Field label="Тренировок в неделю">
+                          <Input className="rounded-xl" type="number" value={data.training.daysPerWeek} onChange={(e) => setData((d: UserState) => ({ ...d, training: { ...d.training, daysPerWeek: Number(e.target.value) } }))} />
+                        </Field>
+                        <Field label="Кардио дней/нед">
+                          <Input className="rounded-xl" type="number" value={data.training.cardioDays} onChange={(e) => setData((d: UserState) => ({ ...d, training: { ...d.training, cardioDays: Number(e.target.value) } }))} />
+                        </Field>
+                      </div>
+
+                      <Field label="Заметки" hint="травмы/ограничения/пожелания">
+                        <Textarea className="rounded-xl" value={data.training.notes} onChange={(e) => setData((d: UserState) => ({ ...d, training: { ...d.training, notes: e.target.value } }))} placeholder="Например: болит плечо, не хочу приседы…" />
+                      </Field>
+
+                      <Separator />
+
+                      <div className="grid gap-2">
+                        <div className="text-sm font-medium">Домашнее оборудование</div>
+                        <div className="text-xs text-muted-foreground">Если выбран зал — предполагаем, что всё есть.</div>
+                        <div className="grid gap-2 sm:grid-cols-2">
+                          {EQUIPMENT.filter((e) => e.id !== "none").map((eq) => {
+                            const checked = Boolean(data.training.homeEquipment?.[eq.id]);
+                            return (
+                              <div key={eq.id} className="flex items-center gap-2 rounded-xl border p-2">
+                                <Checkbox
+                                  checked={checked}
+                                  onCheckedChange={(v) =>
+                                    setData((d: UserState) => ({
+                                      ...d,
+                                      training: { ...d.training, homeEquipment: { ...d.training.homeEquipment, [eq.id]: Boolean(v) } },
+                                    }))
+                                  }
+                                />
+                                <div className="text-sm">{eq.label}</div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    </CardContent>
+                  </Card>
+
+                  <Card className="rounded-2xl shadow-sm">
+                    <CardHeader><CardTitle>План тренировок</CardTitle></CardHeader>
+                    <CardContent className="grid gap-4">
+                      <div className="rounded-2xl border bg-muted/30 p-3 text-sm">
+                        <div className="font-medium">Кардио</div>
+                        <div className="text-sm text-muted-foreground mt-1">{workoutPlan.cardio.recommendation}</div>
+                        <div className="text-xs text-muted-foreground mt-2">Сон и шаги — тайные чит-коды прогресса.</div>
+                      </div>
+
+                      <div className="grid gap-3">
+                        {workoutPlan.sessions.map((s: any, idx: number) => (
+                          <div key={idx} className="rounded-2xl border p-3">
+                            <div className="flex items-center justify-between gap-3">
+                              <div className="font-medium">День {idx + 1}: {s.title}</div>
+                              <Badge variant="secondary">{s.exercises.length} упражн.</Badge>
+                            </div>
+                            <div className="mt-3 grid gap-2">
+                              {s.exercises.map((ex: any) => (
+                                <div key={ex.id} className="flex flex-col gap-1 rounded-xl border p-2">
+                                  <div className="flex items-start justify-between gap-3">
+                                    <div className="flex items-start gap-3">
+                                      <div className="rounded-xl overflow-hidden border bg-muted/20 shrink-0">
+                                        <img
+                                          src={getExerciseImage(data, ex)}
+                                          alt={ex.name}
+                                          className="h-14 w-20 object-cover"
+                                        />
+                                      </div>
+                                      <div>
+                                        <div className="text-sm font-medium">{ex.name}</div>
+                                        <div className="text-xs text-muted-foreground">
+                                          Главная: {ex.muscle}
+                                          {ex.secondaryMuscles?.length ? ` · Вспомог.: ${ex.secondaryMuscles.join(", ")}` : ""}
+                                        </div>
+                                      </div>
+                                    </div>
+                                    <div className="text-sm font-medium">{ex.prescription}</div>
+                                  </div>
+                                  <div className="flex items-center justify-between text-xs text-muted-foreground">
+                                    <div>Отдых: {ex.rest}</div>
+                                    <div className="flex gap-1 flex-wrap justify-end">
+                                      {(ex.equip || []).map((e: string) => (
+                                        <Badge key={e} variant="outline" className="rounded-xl">{EQUIPMENT.find((x) => x.id === e)?.label || e}</Badge>
+                                      ))}
+                                    </div>
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+
+                      <div className="text-xs text-muted-foreground">Прогрессия: верхний предел повторов легко → добавь 1–2 повтора или +2–5% веса.</div>
+                    </CardContent>
+                  </Card>
+                </div>
+              </TabsContent>
+
+              <TabsContent value="tracker" className="mt-4">
+                <WorkoutTracker data={data} setData={setData} workoutPlan={workoutPlan} />
+              </TabsContent>
+
+              <TabsContent value="week" className="mt-4">
+                <WeeklyMuscleReport data={data} />
+              </TabsContent>
+            </Tabs>
+          </TabsContent>
+
+          {/* PROGRESS */}
+          <TabsContent value="progress" className="mt-4">
+            <div className="grid gap-4 md:grid-cols-2">
+              <Card className="rounded-2xl shadow-sm">
+                <CardHeader><CardTitle>Добавить замеры/вес</CardTitle></CardHeader>
+                <CardContent className="grid gap-4">
+                  <div className="grid gap-4 sm:grid-cols-2">
+                    <Field label="Дата"><Input className="rounded-xl" type="date" value={newLog.dateISO} onChange={(e) => setNewLog((s) => ({ ...s, dateISO: e.target.value }))} /></Field>
+                    <Field label="Вес (кг)"><Input className="rounded-xl" type="number" value={newLog.weightKg} onChange={(e) => setNewLog((s) => ({ ...s, weightKg: e.target.value }))} /></Field>
+                    <Field label="Талия (см)"><Input className="rounded-xl" type="number" value={newLog.waistCm} onChange={(e) => setNewLog((s) => ({ ...s, waistCm: e.target.value }))} /></Field>
+                    <Field label="Грудь (см)"><Input className="rounded-xl" type="number" value={newLog.chestCm} onChange={(e) => setNewLog((s) => ({ ...s, chestCm: e.target.value }))} /></Field>
+                    <Field label="Бёдра (см)"><Input className="rounded-xl" type="number" value={newLog.hipCm} onChange={(e) => setNewLog((s) => ({ ...s, hipCm: e.target.value }))} /></Field>
+                  </div>
+                  <Button className="rounded-xl" onClick={addLog}>Сохранить</Button>
+
+                  <div className="rounded-2xl border bg-muted/30 p-3 text-sm">
+                    <div className="font-medium">Последняя запись</div>
+                    {lastLog ? (
+                      <div className="mt-2 grid gap-1 text-sm text-muted-foreground">
+                        <div>Дата: <span className="text-foreground font-medium">{lastLog.dateISO}</span></div>
+                        <div>Вес: <span className="text-foreground font-medium">{lastLog.weightKg ?? "—"} кг</span></div>
+                        <div>Талия: <span className="text-foreground font-medium">{lastLog.waistCm ?? "—"} см</span></div>
+                      </div>
+                    ) : (
+                      <div className="text-muted-foreground mt-2">Пока нет данных.</div>
+                    )}
+                  </div>
+                </CardContent>
+              </Card>
+
+              <Card className="rounded-2xl shadow-sm">
+                <CardHeader><CardTitle>График прогресса</CardTitle></CardHeader>
+                <CardContent className="grid gap-4">
+                  {progressSeries.length ? (
+                    <div className="h-72">
+                      <ResponsiveContainer width="100%" height="100%">
+                        <LineChart data={progressSeries} margin={{ top: 10, right: 20, bottom: 0, left: 0 }}>
+                          <CartesianGrid strokeDasharray="3 3" />
+                          <XAxis dataKey="date" tick={{ fontSize: 12 }} interval="preserveStartEnd" />
+                          <YAxis tick={{ fontSize: 12 }} />
+                          <Tooltip />
+                          <Line type="monotone" dataKey="weight" dot={false} />
+                        </LineChart>
+                      </ResponsiveContainer>
+                    </div>
+                  ) : (
+                    <div className="text-sm text-muted-foreground">Добавь хотя бы одну запись, чтобы увидеть график.</div>
+                  )}
+
+                  <div className="rounded-2xl border p-3">
+                    <div className="text-sm font-medium">Журнал</div>
+                    <div className="mt-2 grid gap-2">
+                      {(data.progress.logs || [])
+                        .slice()
+                        .sort((a: any, b: any) => String(b.dateISO).localeCompare(String(a.dateISO)))
+                        .map((l: any) => (
+                          <div key={l.dateISO} className="flex items-center justify-between gap-3 rounded-xl border p-2">
+                            <div>
+                              <div className="text-sm font-medium">{l.dateISO}</div>
+                              <div className="text-xs text-muted-foreground">Вес: {l.weightKg ?? "—"} кг · Талия: {l.waistCm ?? "—"} см</div>
+                            </div>
+                            <Button
+                              variant="secondary"
+                              className="rounded-xl"
+                              onClick={() =>
+                                setData((d: UserState) => ({
+                                  ...d,
+                                  progress: { ...d.progress, logs: (d.progress.logs || []).filter((x: any) => x.dateISO !== l.dateISO) },
+                                }))
+                              }
+                            >
+                              Удалить
+                            </Button>
+                          </div>
+                        ))}
+                    </div>
+                  </div>
+                </CardContent>
+              </Card>
+            </div>
+          </TabsContent>
+
+          {/* EXERCISES */}
+          <TabsContent value="exercises" className="mt-4">
+            <ExerciseDB data={data} setData={setData} availableEquipment={availableEquipment} />
+          </TabsContent>
+        </Tabs>
+
+        <div className="text-xs text-muted-foreground">⚠️ Не мед. рекомендация. Если есть заболевания/травмы — согласуй дефицит и нагрузку с врачом/тренером.</div>
+      </div>
+    </div>
+  );
+}
+
+function NutritionWeek({
+  menu,
+  caloriesTarget,
+  data,
+  setData,
+}: {
+  menu: PlannedDay[];
+  caloriesTarget: number;
+  data: UserState;
+  setData: any;
+}) {
+  const [open, setOpen] = useState<Record<string, boolean>>({});
+
+  return (
+    <div className="grid gap-3">
+      {menu.map((d) => {
+        const actualDay = data.nutrition.actual?.[d.dateISO];
+        const totals = computeActualTotals(d, actualDay);
+        const delta = Math.round((totals.kcal || 0) - caloriesTarget);
+
+        return (
+          <div key={d.day + d.dateISO} className="rounded-2xl border p-3">
+            <div className="flex items-center justify-between gap-3">
+              <div className="font-medium">{d.day} · {d.dateISO}</div>
+              <div className="flex items-center gap-2 flex-wrap justify-end">
+                <Badge variant="secondary">{totals.kcal} ккал</Badge>
+                <Badge variant="outline">{totals.p}P</Badge>
+                <Badge variant="outline">{totals.f}F</Badge>
+                <Badge variant="outline">{totals.c}C</Badge>
+                <Badge variant={Math.abs(delta) <= 150 ? "secondary" : "outline"} className="rounded-xl">
+                  {delta >= 0 ? `+${delta}` : `${delta}`} ккал
+                </Badge>
+              </div>
+            </div>
+
+            <div className="mt-3 grid gap-2">
+              {d.meals.map((m) => {
+                const key = `${d.dateISO}__${m.slot}`;
+                const isOpen = Boolean(open[key]);
+                const actual = data.nutrition.actual?.[d.dateISO]?.meals?.[m.slot];
+
+                const shownName = actual ? actual.name : m.name;
+                const shownKcal = actual ? (actual.eaten ? actual.kcal : 0) : m.kcal;
+                const shownP = actual ? (actual.eaten ? actual.p : 0) : m.p;
+                const shownF = actual ? (actual.eaten ? actual.f : 0) : m.f;
+                const shownC = actual ? (actual.eaten ? actual.c : 0) : m.c;
+
+                return (
+                  <div key={m.slot + m.name} className="rounded-xl border p-2">
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <div className="text-sm font-medium">{m.slot}</div>
+                        <div className="text-sm text-muted-foreground">{shownName}</div>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <div className="text-sm font-medium">{shownKcal} ккал</div>
+                        <Button
+                          variant="secondary"
+                          className="rounded-xl"
+                          onClick={() => {
+                            setData((u: UserState) => ({
+                              ...u,
+                              nutrition: {
+                                ...u.nutrition,
+                                actual: ensureActualMealEntry(u.nutrition.actual || {}, d.dateISO, m.slot, {
+                                  name: m.name,
+                                  kcal: m.kcal,
+                                  p: m.p,
+                                  f: m.f,
+                                  c: m.c,
+                                }),
+                              },
+                            }));
+                            setOpen((p) => ({ ...p, [key]: !p[key] }));
+                          }}
+                        >
+                          {isOpen ? "Закрыть" : "Факт"}
+                        </Button>
+                      </div>
+                    </div>
+
+                    <div className="mt-2 flex flex-wrap gap-1 text-xs">
+                      <Badge variant="secondary" className="rounded-xl">{shownP}P</Badge>
+                      <Badge variant="secondary" className="rounded-xl">{shownF}F</Badge>
+                      <Badge variant="secondary" className="rounded-xl">{shownC}C</Badge>
+                      <Badge variant="outline" className="rounded-xl">план ×{round(m.scale || 1, 2)}</Badge>
+                      {actual && !actual.eaten ? <Badge variant="outline" className="rounded-xl">не ел</Badge> : null}
+                    </div>
+
+                    {isOpen ? (
+                      <div className="mt-3 rounded-xl border bg-muted/20 p-3 grid gap-3">
+                        <div className="flex items-center justify-between gap-3">
+                          <div className="text-sm font-medium">Что съел по факту</div>
+                          <div className="flex items-center gap-2">
+                            <div className="text-xs text-muted-foreground">Съел</div>
+                            <Checkbox
+                              checked={Boolean(actual?.eaten)}
+                              onCheckedChange={(v) =>
+                                setData((u: UserState) => ({
+                                  ...u,
+                                  nutrition: {
+                                    ...u.nutrition,
+                                    actual: {
+                                      ...(u.nutrition.actual || {}),
+                                      [d.dateISO]: {
+                                        meals: {
+                                          ...(u.nutrition.actual?.[d.dateISO]?.meals || {}),
+                                          [m.slot]: { ...(u.nutrition.actual?.[d.dateISO]?.meals?.[m.slot] as any), eaten: Boolean(v) },
+                                        },
+                                      },
+                                    },
+                                  },
+                                }))
+                              }
+                            />
+                          </div>
+                        </div>
+
+                        <FoodComposer
+                          foods={(actual?.foods || []) as any}
+                          onChange={(next) =>
+                            setData((u: UserState) => ({
+                              ...u,
+                              nutrition: {
+                                ...u.nutrition,
+                                actual: {
+                                  ...(u.nutrition.actual || {}),
+                                  [d.dateISO]: {
+                                    meals: {
+                                      ...(u.nutrition.actual?.[d.dateISO]?.meals || {}),
+                                      [m.slot]: { ...(u.nutrition.actual?.[d.dateISO]?.meals?.[m.slot] as any), foods: next },
+                                    },
+                                  },
+                                },
+                              },
+                            }))
+                          }
+                          onApply={() => {
+                            const computed = computeMealFromFoods(actual?.foods || []);
+                            if (!computed.kcal && !(actual?.foods || []).length) return;
+                            setData((u: UserState) => ({
+                              ...u,
+                              nutrition: {
+                                ...u.nutrition,
+                                actual: {
+                                  ...(u.nutrition.actual || {}),
+                                  [d.dateISO]: {
+                                    meals: {
+                                      ...(u.nutrition.actual?.[d.dateISO]?.meals || {}),
+                                      [m.slot]: {
+                                        ...(u.nutrition.actual?.[d.dateISO]?.meals?.[m.slot] as any),
+                                        name: computed.name || (u.nutrition.actual?.[d.dateISO]?.meals?.[m.slot] as any)?.name,
+                                        kcal: computed.kcal,
+                                        p: computed.p,
+                                        f: computed.f,
+                                        c: computed.c,
+                                      },
+                                    },
+                                  },
+                                },
+                              },
+                            }));
+                          }}
+                        />
+
+                        <Separator />
+
+                        <div className="text-sm font-medium">Ручная правка (если надо)</div>
+                        <Field label="Название">
+                          <Input
+                            className="rounded-xl"
+                            value={actual?.name ?? m.name}
+                            onChange={(e) =>
+                              setData((u: UserState) => ({
+                                ...u,
+                                nutrition: {
+                                  ...u.nutrition,
+                                  actual: {
+                                    ...(u.nutrition.actual || {}),
+                                    [d.dateISO]: {
+                                      meals: {
+                                        ...(u.nutrition.actual?.[d.dateISO]?.meals || {}),
+                                        [m.slot]: { ...(u.nutrition.actual?.[d.dateISO]?.meals?.[m.slot] as any), name: e.target.value },
+                                      },
+                                    },
+                                  },
+                                },
+                              }))
+                            }
+                          />
+                        </Field>
+
+                        <div className="grid gap-3 sm:grid-cols-4">
+                          <Field label="ккал">
+                            <Input
+                              className="rounded-xl"
+                              type="number"
+                              value={String(actual?.kcal ?? m.kcal)}
+                              onChange={(e) => {
+                                const v = Number(e.target.value);
+                                setData((u: UserState) => ({
+                                  ...u,
+                                  nutrition: {
+                                    ...u.nutrition,
+                                    actual: {
+                                      ...(u.nutrition.actual || {}),
+                                      [d.dateISO]: {
+                                        meals: {
+                                          ...(u.nutrition.actual?.[d.dateISO]?.meals || {}),
+                                          [m.slot]: { ...(u.nutrition.actual?.[d.dateISO]?.meals?.[m.slot] as any), kcal: v },
+                                        },
+                                      },
+                                    },
+                                  },
+                                }));
+                              }}
+                            />
+                          </Field>
+                          <Field label="P (г)">
+                            <Input
+                              className="rounded-xl"
+                              type="number"
+                              value={String(actual?.p ?? m.p)}
+                              onChange={(e) => {
+                                const v = Number(e.target.value);
+                                setData((u: UserState) => ({
+                                  ...u,
+                                  nutrition: {
+                                    ...u.nutrition,
+                                    actual: {
+                                      ...(u.nutrition.actual || {}),
+                                      [d.dateISO]: {
+                                        meals: {
+                                          ...(u.nutrition.actual?.[d.dateISO]?.meals || {}),
+                                          [m.slot]: { ...(u.nutrition.actual?.[d.dateISO]?.meals?.[m.slot] as any), p: v },
+                                        },
+                                      },
+                                    },
+                                  },
+                                }));
+                              }}
+                            />
+                          </Field>
+                          <Field label="F (г)">
+                            <Input
+                              className="rounded-xl"
+                              type="number"
+                              value={String(actual?.f ?? m.f)}
+                              onChange={(e) => {
+                                const v = Number(e.target.value);
+                                setData((u: UserState) => ({
+                                  ...u,
+                                  nutrition: {
+                                    ...u.nutrition,
+                                    actual: {
+                                      ...(u.nutrition.actual || {}),
+                                      [d.dateISO]: {
+                                        meals: {
+                                          ...(u.nutrition.actual?.[d.dateISO]?.meals || {}),
+                                          [m.slot]: { ...(u.nutrition.actual?.[d.dateISO]?.meals?.[m.slot] as any), f: v },
+                                        },
+                                      },
+                                    },
+                                  },
+                                }));
+                              }}
+                            />
+                          </Field>
+                          <Field label="C (г)">
+                            <Input
+                              className="rounded-xl"
+                              type="number"
+                              value={String(actual?.c ?? m.c)}
+                              onChange={(e) => {
+                                const v = Number(e.target.value);
+                                setData((u: UserState) => ({
+                                  ...u,
+                                  nutrition: {
+                                    ...u.nutrition,
+                                    actual: {
+                                      ...(u.nutrition.actual || {}),
+                                      [d.dateISO]: {
+                                        meals: {
+                                          ...(u.nutrition.actual?.[d.dateISO]?.meals || {}),
+                                          [m.slot]: { ...(u.nutrition.actual?.[d.dateISO]?.meals?.[m.slot] as any), c: v },
+                                        },
+                                      },
+                                    },
+                                  },
+                                }));
+                              }}
+                            />
+                          </Field>
+                        </div>
+
+                        <div className="flex flex-wrap gap-2">
+                          <Button
+                            variant="secondary"
+                            className="rounded-xl"
+                            onClick={() => {
+                              setData((u: UserState) => {
+                                const day = u.nutrition.actual?.[d.dateISO];
+                                if (!day?.meals?.[m.slot]) return u;
+                                const { [m.slot]: _rm, ...restMeals } = day.meals;
+                                const nextActual = { ...(u.nutrition.actual || {}) };
+                                if (Object.keys(restMeals).length === 0) {
+                                  delete nextActual[d.dateISO];
+                                } else {
+                                  nextActual[d.dateISO] = { meals: restMeals as any };
+                                }
+                                return { ...u, nutrition: { ...u.nutrition, actual: nextActual } };
+                              });
+                            }}
+                          >
+                            Сбросить факт (этот приём)
+                          </Button>
+                        </div>
+                      </div>
+                    ) : null}
+                  </div>
+                );
+              })}
+            </div>
+
+            <div className="mt-3 flex flex-wrap gap-2">
+              <Button
+                variant="secondary"
+                className="rounded-xl"
+                onClick={() =>
+                  setData((u: UserState) => {
+                    const next = { ...(u.nutrition.actual || {}) };
+                    delete next[d.dateISO];
+                    return { ...u, nutrition: { ...u.nutrition, actual: next } };
+                  })
+                }
+              >
+                Сбросить факт за день
+              </Button>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function ExerciseDB({ data, setData, availableEquipment }: { data: UserState; setData: any; availableEquipment: string[] }) {
+  const [query, setQuery] = useState("");
+  const [muscle, setMuscle] = useState("all");
+  const [onlyDoable, setOnlyDoable] = useState(true);
+
+  const available = useMemo(() => {
+    const s = new Set(availableEquipment);
+    if (data.training.location === "gym") {
+      ["cable", "machines", "bench", "barbell", "dumbbells"].forEach((x) => s.add(x));
+    }
+    return s;
+  }, [availableEquipment, data.training.location]);
+
+  const list = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    return EXERCISES.filter((e) => {
+      if (muscle !== "all" && e.muscle !== muscle) return false;
+      if (q && !e.name.toLowerCase().includes(q)) return false;
+      if (onlyDoable && !hasAllEquipment(e, available)) return false;
+      return true;
+    });
+  }, [query, muscle, onlyDoable, available]);
+
+  const missingList = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    return EXERCISES.filter((e) => {
+      if (muscle !== "all" && e.muscle !== muscle) return false;
+      if (q && !e.name.toLowerCase().includes(q)) return false;
+      if (hasAllEquipment(e, available)) return false;
+      return true;
+    });
+  }, [query, muscle, available]);
+
+  return (
+    <div className="grid gap-4 md:grid-cols-2">
+      <Card className="rounded-2xl shadow-sm">
+        <CardHeader><CardTitle>База упражнений</CardTitle></CardHeader>
+        <CardContent className="grid gap-4">
+          <div className="grid gap-3">
+            <Field label="Поиск"><Input className="rounded-xl" value={query} onChange={(e) => setQuery(e.target.value)} placeholder="например: тяга, жим, присед" /></Field>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <Field label="Группа">
+                <Select value={muscle} onValueChange={setMuscle}>
+                  <SelectTrigger className="rounded-xl"><SelectValue placeholder="Выбери" /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">Все</SelectItem>
+                    <SelectItem value="Грудь">Грудь</SelectItem>
+                    <SelectItem value="Спина">Спина</SelectItem>
+                    <SelectItem value="Ноги">Ноги</SelectItem>
+                    <SelectItem value="Плечи">Плечи</SelectItem>
+                    <SelectItem value="Руки">Руки</SelectItem>
+                    <SelectItem value="Кор">Кор</SelectItem>
+                  </SelectContent>
+                </Select>
+              </Field>
+              <div className="rounded-2xl border p-3 flex items-center justify-between">
+                <div>
+                  <div className="text-sm font-medium">Только доступные</div>
+                  <div className="text-xs text-muted-foreground">по твоему оборудованию</div>
+                </div>
+                <Switch checked={onlyDoable} onCheckedChange={setOnlyDoable} />
+              </div>
+            </div>
+            <div className="rounded-2xl border bg-muted/30 p-3 text-xs text-muted-foreground">Зал = почти всё доступно. Дом = только отмеченное.</div>
+          </div>
+
+          <div className="grid gap-2">
+            {list.map((e) => (
+              <ExerciseRow key={e.id} ex={e} data={data} setData={setData} available={available} />
+            ))}
+            {!list.length ? <div className="text-sm text-muted-foreground">Ничего не найдено.</div> : null}
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card className="rounded-2xl shadow-sm">
+        <CardHeader><CardTitle>Замены (нет оборудования → делаем это)</CardTitle></CardHeader>
+        <CardContent className="grid gap-4">
+          <div className="text-sm text-muted-foreground">Показываю недоступные упражнения и варианты замен.</div>
+
+          <div className="grid gap-3">
+            {missingList.slice(0, 10).map((e) => {
+              const suggestions = suggestSubstitutions({ exercise: e, available });
+              return (
+                <div key={e.id} className="rounded-2xl border p-3">
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <div className="text-sm font-medium">{e.name}</div>
+                      <div className="text-xs text-muted-foreground">
+                        Нужно: {(e.equip || [])
+                          .filter((x) => x !== "none")
+                          .map((x) => EQUIPMENT.find((z) => z.id === x)?.label || x)
+                          .join(", ") || "—"}
+                      </div>
+                    </div>
+                    <Badge variant="destructive" className="rounded-xl">нет</Badge>
+                  </div>
+
+                  <div className="mt-3 grid gap-2">
+                    {suggestions.length ? (
+                      suggestions.map((s) => (
+                        <div key={s.id} className="rounded-xl border p-2">
+                          <div className="flex items-start justify-between gap-3">
+                            <div>
+                              <div className="text-sm font-medium">→ {s.name}</div>
+                              <div className="text-xs text-muted-foreground">{s.muscle}</div>
+                            </div>
+                            <Badge variant="secondary" className="rounded-xl">доступно</Badge>
+                          </div>
+                          <div className="mt-2 text-xs text-muted-foreground">Оборудование: {(s.equip || []).map((x) => EQUIPMENT.find((z) => z.id === x)?.label || x).join(", ")}</div>
+                        </div>
+                      ))
+                    ) : (
+                      <div className="text-sm text-muted-foreground">Не нашёл замену (добавь оборудование или расширь базу).</div>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+            {!missingList.length ? <div className="rounded-2xl border bg-muted/30 p-3 text-sm">Похоже, всё доступно 😄</div> : null}
+          </div>
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
+function ExerciseRow({
+  ex,
+  available,
+  data,
+  setData,
+}: {
+  ex: Exercise;
+  available: Set<string>;
+  data: UserState;
+  setData: any;
+}) {
+  const can = hasAllEquipment(ex, available);
+  const img = getExerciseImage(data, ex);
+  const hasOverride = Boolean(data?.library?.exerciseMedia?.[ex.id]);
+  const [show, setShow] = useState(false);
+
+  const setPhotoUrl = () => {
+    const url = prompt(
+      "Вставь прямую ссылку на короткий GIF (лучше .gif) или видео (.mp4/.webm).
+Подойдут: https://...  или data:image/... / data:video/...
+
+Оставь пустым и нажми OK — чтобы отменить.",
+      data?.library?.exerciseMedia?.[ex.id] || ""
+    );
+    if (url === null) return; // cancel
+    const trimmed = url.trim();
+    if (!trimmed) return;
+
+    setData((d: UserState) => ({
+      ...d,
+      library: {
+        ...(d.library || { exerciseMedia: {} }),
+        exerciseMedia: {
+          ...(d.library?.exerciseMedia || {}),
+          [ex.id]: trimmed,
+        },
+      },
+    }));
+  };
+
+  const resetPhoto = () => {
+    setData((d: UserState) => {
+      const prev = d.library?.exerciseMedia || {};
+      if (!prev[ex.id]) return d;
+      const next = { ...prev };
+      delete next[ex.id];
+      return {
+        ...d,
+        library: {
+          ...(d.library || { exerciseMedia: {} }),
+          exerciseMedia: next,
+        },
+      };
+    });
+  };
+
+  return (
+    <div className="rounded-2xl border p-3">
+      <div className="flex items-start justify-between gap-3">
+        <div className="flex items-start gap-3">
+          <button
+            className="rounded-xl overflow-hidden border bg-muted/20 shrink-0"
+            type="button"
+            onClick={() => setShow((s) => !s)}
+            title="Показать/скрыть картинку"
+          >
+            <ExerciseMedia src={img} alt={ex.name} mode="thumb" className="h-16 w-24 object-cover" />
+          </button>
+
+          <div>
+            <div className="text-sm font-medium">{ex.name}</div>
+            <div className="text-xs text-muted-foreground">
+              Главная: {ex.muscle}
+              {ex.secondaryMuscles?.length ? ` · Вспомог.: ${ex.secondaryMuscles.join(", ")}` : ""}
+            </div>
+            <div className="mt-2 flex flex-wrap gap-1">{(ex.equip || []).map((e) => <Badge key={e} variant="outline" className="rounded-xl">{EQUIPMENT.find((x) => x.id === e)?.label || e}</Badge>)}</div>
+            <div className="mt-2 flex flex-wrap gap-2">
+              <Button size="sm" variant="secondary" className="rounded-xl" onClick={setPhotoUrl}>
+                {hasOverride ? "Изменить фото" : "Добавить фото"}
+              </Button>
+              <Button size="sm" variant="secondary" className="rounded-xl" onClick={resetPhoto} disabled={!hasOverride}>
+                Сброс
+              </Button>
+              <Button size="sm" variant="secondary" className="rounded-xl" onClick={() => setShow(true)}>
+                Показать
+              </Button>
+            </div>
+          </div>
+        </div>
+
+        <Badge variant={can ? "secondary" : "destructive"} className="rounded-xl">{can ? "доступно" : "нет"}</Badge>
+      </div>
+
+      {show ? (
+        <div className="mt-3 rounded-2xl border bg-muted/10 p-2">
+          <ExerciseMedia src={img} alt={ex.name} mode="full" className="w-full max-h-[420px] object-contain rounded-xl" />
+          <div className="mt-2 text-xs text-muted-foreground">
+            Если хочешь именно фотографию — нажми «Добавить фото» и вставь URL (например, с твоего облака/галереи).
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+// -----------------------------
+// Minimal self-tests (console)
+// -----------------------------
+
+function runSelfTests() {
+  try {
+    const b = calcBMR({ sex: "male", weightKg: 70, heightCm: 175, age: 30 } as any);
+    console.assert(Math.round(b) === 1649, "calcBMR sanity");
+
+    console.assert(activityFactor("moderate") === 1.55, "activityFactor sanity");
+
+    const m = macroTargets({ weightKg: 80, caloriesTarget: 2200, focus: "fat_loss" });
+    console.assert(m.p >= 80 && m.f >= 40 && m.c >= 0, "macroTargets sanity");
+
+    const pr = parsePrescription("3×6–10");
+    console.assert(pr.sets === 3 && pr.minReps === 6 && pr.maxReps === 10, "parsePrescription sanity");
+
+    const ws = weekStartMondayISO(new Date(2025, 0, 1));
+    console.assert(/^\d{4}-\d{2}-\d{2}$/.test(ws), "weekStart iso format");
+
+    const d2 = addDaysISO("2025-01-01", 3);
+    console.assert(d2 === "2025-01-04", "addDaysISO sanity");
+
+    const meal = computeMealFromFoods([
+      { foodId: "chicken_breast", grams: 100 },
+      { foodId: "rice", grams: 50 },
+    ]);
+    console.assert(meal.kcal > 0 && meal.p > 0, "computeMealFromFoods sanity");
+
+    const ex0 = resolveExercise("pushup") as any;
+    const img0 = placeholderExerciseImage(ex0);
+    console.assert(String(img0).startsWith("data:image/svg+xml"), "placeholder image uri");
+
+    const dummyLogs: WorkoutLog[] = [
+      {
+        id: "x",
+        dateISO: "2025-01-06",
+        sessionTitle: "A",
+        sessionIdx: 0,
+        entries: [
+          { exerciseId: "pushup", prescription: "3×10–15", sets: [{ reps: 10, weight: null }, { reps: 10, weight: null }, { reps: 10, weight: null }] },
+          { exerciseId: "squat_bw", prescription: "3×10–15", sets: [{ reps: 12, weight: null }, { reps: 12, weight: null }, { reps: 12, weight: null }] },
+        ],
+      },
+    ];
+    const rep = computeWeeklyMuscleUsage(dummyLogs, "2025-01-06");
+    console.assert(rep.data.length >= 2, "weekly muscle usage sanity");
+    const chest = rep.data.find((x: any) => x.muscle === "Грудь");
+    const legs = rep.data.find((x: any) => x.muscle === "Ноги");
+    const core = rep.data.find((x: any) => x.muscle === "Кор");
+    console.assert(chest?.primarySets === 3, "primary sets chest");
+    console.assert(legs?.primarySets === 3, "primary sets legs");
+    // присед имеет вторичную "Кор" — значит кор должен получить secondary
+    console.assert((core?.secondarySets || 0) >= 3, "secondary sets core");
+
+    return true;
+  } catch (e) {
+    console.warn("Self-tests failed", e);
+    return false;
+  }
+}
+
+const g: any = globalThis as any;
+if (typeof window !== "undefined" && !g.__VIBE_COACH_TESTS_RAN__) {
+  g.__VIBE_COACH_TESTS_RAN__ = true;
+  runSelfTests();
+}
